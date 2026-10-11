@@ -57,6 +57,7 @@ python -m src.data_prep        # clean the data, build the distance matrix, prin
 python -m src.exact_ilp        # solve an 8-customer instance exactly with the ILP (CBC)
 python -m src.verify_exact     # check the ILP against exhaustive search on 6 small instances (~1 min)
 jupyter notebook notebooks/01_data_and_model.ipynb   # data tour, formulation and ILP demo
+python -m src.run_comparison   # experiments E1 + E2: ILP vs greedy vs SA (about 1 hour)
 ```
 
 In VS Code, choose the `.venv` Python as the notebook kernel, otherwise `pulp` will not be found.
