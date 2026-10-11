@@ -1,0 +1,6 @@
+pandas==3.0.6
+openpyxl==3.1.5
+numpy==2.5.4
+pulp==2.9.0
+matplotlib==3.11.2
+jupyter==1.1.1
