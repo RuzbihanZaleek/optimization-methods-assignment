@@ -1,0 +1,6 @@
+platform: Windows-11-10.0.26300-SP0
+processor: AMD64 Family 25 Model 68 Stepping 1, AuthenticAMD
+logical CPUs: 16
+python: 3.13.10
+ILP time limit (E5): 300 s
+SA seeds: 0-9
