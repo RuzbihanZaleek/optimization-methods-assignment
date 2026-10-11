@@ -45,8 +45,8 @@ def load_raw(path=RAW_PATH):
 def clean_customers(raw):
     """Keep only real customer rows and give every column a usable type.
 
-    The sheet has about 20,000 extra rows below customer 87 that contain only an
-    OPERATING SLOTS value. A row is a real customer only if CUSTOMER ID is filled.
+    pandas reads 25,734 rows, but only 87 have a CUSTOMER ID. The other 25,647 rows hold only
+    an OPERATING SLOTS value or are empty. A row is a real customer only if CUSTOMER ID is filled.
     """
     df = raw.rename(columns=COLUMN_NAMES)
     df = df[df["customer_id"].notna()].copy()
