@@ -56,7 +56,10 @@ All commands are run from the repository root with the virtual environment activ
 python -m src.data_prep        # clean the data, build the distance matrix, print checks
 python -m src.exact_ilp        # solve an 8-customer instance exactly with the ILP (CBC)
 python -m src.verify_exact     # check the ILP against exhaustive search on 6 small instances (~1 min)
+jupyter notebook notebooks/01_data_and_model.ipynb   # data tour, formulation and ILP demo
 ```
+
+In VS Code, choose the `.venv` Python as the notebook kernel, otherwise `pulp` will not be found.
 
 More commands will be added as the methods and experiments are implemented.
 
