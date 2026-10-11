@@ -54,6 +54,7 @@ All commands are run from the repository root with the virtual environment activ
 
 ```powershell
 python -m src.data_prep        # clean the data, build the distance matrix, print checks
+python -m src.exact_ilp        # solve an 8-customer instance exactly with the ILP (CBC)
 ```
 
 More commands will be added as the methods and experiments are implemented.
