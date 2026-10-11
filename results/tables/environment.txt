@@ -1,0 +1,9 @@
+platform: Windows-11-10.0.26200-SP0
+processor: Intel64 Family 6 Model 186 Stepping 2, GenuineIntel
+logical CPUs: 16
+python: 3.12.4
+pulp: 2.9.0 (CBC solver bundled with PuLP)
+pandas: 3.0.6
+ILP time limit: 300 s
+SA iterations per run: 1000000
+capacity Q: 1000.0 kg
