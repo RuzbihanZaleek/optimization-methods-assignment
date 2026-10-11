@@ -5,7 +5,7 @@ IT50802 Optimization Methods, MSc in Artificial Intelligence (SLIIT), group prog
 | Member | Student ID |
 |---|---|
 | M.Z.M. Ruzbihan | MS26911458 |
-| Luminda De Silva | MS26903224 |
+| U.D.L.L De Silva | MS26903224 |
 
 ## Problem
 
