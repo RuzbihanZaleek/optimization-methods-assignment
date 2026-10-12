@@ -1,0 +1,2076 @@
+====================================================================================================
+CODE APPENDIX - Delivery Optimization (Capacitated Vehicle Routing Problem)
+IT50802 Optimization Methods, MSc in Artificial Intelligence, SLIIT
+M.Z.M. Ruzbihan (MS26911458) and U.D.L.L De Silva (MS26903224)
+Generated on 2026-10-12 from Git commit 0b53120
+Repository: https://github.com/RuzbihanZaleek/optimization-methods-assignment
+====================================================================================================
+
+Contents
+   1. src/__init__.py - 0 lines
+   2. src/benchmark.py - 107 lines
+   3. src/data_prep.py - 175 lines
+   4. src/evaluate.py - 144 lines
+   5. src/exact_ilp.py - 168 lines
+   6. src/heuristics.py - 286 lines
+   7. src/plots.py - 311 lines
+   8. src/run_comparison.py - 201 lines
+   9. src/run_heuristic_analysis.py - 163 lines
+  10. src/verify_exact.py - 112 lines
+  11. scripts/make_code_appendix.py - 85 lines
+  12. notebooks/01_data_and_model.ipynb (code cells only) - 136 lines
+  13. notebooks/02_heuristic_and_results.ipynb (code cells only) - 112 lines
+
+====================================================================================================
+1. src/__init__.py
+====================================================================================================
+(empty file)
+
+====================================================================================================
+2. src/benchmark.py
+====================================================================================================
+"""Benchmark instance A-n32-k5 (Augerat et al., CVRPLIB) for external validation of our methods.
+
+Owner: Luminda De Silva (Member 2)
+
+Why: on our own data the ILP cannot prove optimality beyond about 12 customers, so we cannot
+measure how good SA is on larger instances. A-n32-k5 (31 customers, Q = 100) has a published
+optimal cost of 784, so it gives an outside yardstick.
+
+CVRPLIB convention: distances are Euclidean and rounded to the nearest integer ("EUC_2D").
+We check that our loader follows this convention by scoring the published optimal routes:
+they must cost exactly 784 with our own evaluate.total_distance().
+
+Files (from the PyVRP/VRPLIB repository, which mirrors CVRPLIB):
+    data/benchmark/A-n32-k5.vrp   instance
+    data/benchmark/A-n32-k5.sol   published optimal routes and cost
+
+Run from the repository root:
+    python -m src.benchmark
+"""
+
+import math
+
+from src.data_prep import REPO_ROOT
+from src.evaluate import check_feasible, total_distance
+
+BENCHMARK_DIR = REPO_ROOT / "data" / "benchmark"
+
+
+def euc_2d(p, q):
+    """CVRPLIB/TSPLIB EUC_2D distance: Euclidean distance rounded to the nearest integer."""
+    return float(int(math.dist(p, q) + 0.5))
+
+
+def load_vrplib_instance(path):
+    """Read a CVRPLIB .vrp file into our instance format (node 0 = depot)."""
+    lines = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    capacity = None
+    coords = {}
+    demand = {}
+    section = None
+    for line in lines:
+        if line.startswith("CAPACITY"):
+            capacity = float(line.split(":")[1])
+        elif line.startswith("NODE_COORD_SECTION"):
+            section = "coords"
+        elif line.startswith("DEMAND_SECTION"):
+            section = "demand"
+        elif line.startswith(("DEPOT_SECTION", "EOF")):
+            section = None
+        elif section == "coords":
+            node, x, y = line.split()
+            coords[int(node)] = (float(x), float(y))
+        elif section == "demand":
+            node, q = line.split()
+            demand[int(node)] = float(q)
+
+    # The file numbers nodes 1..32 with the depot as node 1; we use 0..31 with the depot as 0.
+    file_nodes = sorted(coords)
+    points = [coords[node] for node in file_nodes]
+    return {
+        "name": path.stem,
+        "customer_ids": file_nodes[1:],
+        "xs": [p[0] for p in points],
+        "ys": [p[1] for p in points],
+        "demand": [demand[node] for node in file_nodes],
+        "capacity": capacity,
+        "dist": [[euc_2d(p, q) for q in points] for p in points],
+    }
+
+
+def load_solution(path):
+    """Read a CVRPLIB .sol file. Customer numbers in .sol files already match our 1..n numbering."""
+    routes = []
+    cost = None
+    for line in path.read_text().splitlines():
+        if line.startswith("Route"):
+            customers = [int(c) for c in line.split(":")[1].split()]
+            routes.append([0] + customers + [0])
+        elif line.startswith("Cost"):
+            cost = float(line.split()[1])
+    return routes, cost
+
+
+def load_benchmark(name="A-n32-k5"):
+    """Return (instance, published optimal cost)."""
+    instance = load_vrplib_instance(BENCHMARK_DIR / f"{name}.vrp")
+    _, cost = load_solution(BENCHMARK_DIR / f"{name}.sol")
+    return instance, cost
+
+
+def main():
+    instance, published_cost = load_benchmark()
+    n = len(instance["demand"]) - 1
+    print(f"{instance['name']}: {n} customers, Q = {instance['capacity']:.0f}, "
+          f"total demand {sum(instance['demand']):.0f}, published optimum {published_cost:.0f}")
+
+    routes, _ = load_solution(BENCHMARK_DIR / f"{instance['name']}.sol")
+    our_cost = total_distance(routes, instance["dist"])
+    problems = check_feasible(routes, instance)
+    print(f"Published routes scored by our code: {our_cost:.0f} | feasible: {not problems}")
+    assert problems == [], problems
+    assert our_cost == published_cost, "distance convention does not match CVRPLIB"
+    print("All checks passed: our loader and distance convention match CVRPLIB.")
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+3. src/data_prep.py
+====================================================================================================
+"""Data preparation for the delivery optimization (CVRP) project.
+
+Owner: M.Z.M. Ruzbihan (Member 1)
+
+This module turns the raw Kaggle workbook into the inputs of the optimization model:
+    - a clean table of the 87 real customers,
+    - one depot (assumption A1: centroid of all customers),
+    - a haversine distance matrix d_ij in km (assumption A2),
+    - an "instance" dictionary that both the exact and the heuristic method use.
+
+Run from the repository root:
+    python -m src.data_prep
+"""
+
+import math
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RAW_PATH = REPO_ROOT / "data" / "raw" / "Customer Data.xlsx"
+PROCESSED_PATH = REPO_ROOT / "data" / "processed" / "customers_clean.csv"
+
+EARTH_RADIUS_KM = 6371.0
+VEHICLE_CAPACITY_KG = 1000.0   # assumption A3: payload of a light commercial van
+VAN_VOLUME_DM3 = 3000.0        # assumption A6: only checked after solving
+
+COLUMN_NAMES = {
+    "CUSTOMER ID": "customer_id",
+    "LATITUDE": "lat",
+    "LONGITUDE": "lon",
+    "PRIORITY": "priority",
+    "OPERATING SLOTS": "time_slot",
+    "Order size (weight in kg)": "weight_kg",
+    "Order size (volume in dm^3)": "volume_dm3",
+}
+
+
+def load_raw(path=RAW_PATH):
+    """Read the workbook exactly as it is on Kaggle (no cleaning)."""
+    return pd.read_excel(path, sheet_name="Customer Data")
+
+
+def clean_customers(raw):
+    """Keep only real customer rows and give every column a usable type.
+
+    pandas reads 25,734 rows, but only 87 have a CUSTOMER ID. The other 25,647 rows hold only
+    an OPERATING SLOTS value or are empty. A row is a real customer only if CUSTOMER ID is filled.
+    """
+    df = raw.rename(columns=COLUMN_NAMES)
+    df = df[df["customer_id"].notna()].copy()
+
+    df["customer_id"] = df["customer_id"].astype(int)
+    df["priority"] = df["priority"].astype(int)
+    # Remove floating-point noise such as 43.10000000000001
+    df["weight_kg"] = df["weight_kg"].round(1)
+    df["volume_dm3"] = df["volume_dm3"].round(1)
+
+    df = df.sort_values("customer_id").reset_index(drop=True)
+
+    # Checks that must hold for the data described in our report
+    assert len(df) == 87, f"expected 87 customers, found {len(df)}"
+    assert df["customer_id"].is_unique, "customer IDs are not unique"
+    assert df[["lat", "lon", "weight_kg", "volume_dm3"]].notna().all().all(), "missing numeric values"
+    assert (df["weight_kg"] > 0).all(), "every order must have a positive weight"
+    return df
+
+
+def depot_location(customers):
+    """Assumption A1: the depot is the centroid (mean lat, mean lon) of ALL customers.
+
+    It is computed from all 87 customers, so every subset instance uses the same depot.
+    """
+    return float(customers["lat"].mean()), float(customers["lon"].mean())
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Great-circle distance between two points on the Earth, in km (assumption A2)."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+def build_distance_matrix(lats, lons):
+    """d[i][j] = haversine distance from node i to node j. Node 0 is the depot."""
+    n_nodes = len(lats)
+    dist = np.zeros((n_nodes, n_nodes))
+    for i in range(n_nodes):
+        for j in range(n_nodes):
+            if i != j:
+                dist[i, j] = haversine_km(lats[i], lons[i], lats[j], lons[j])
+    return dist
+
+
+def make_instance(customers, depot, capacity=VEHICLE_CAPACITY_KG, name="instance"):
+    """Build the model inputs for a set of customers.
+
+    Node 0 is the depot and nodes 1..n are the customers in the order of `customers`.
+    Routes produced by both methods use these node numbers, e.g. [[0, 3, 1, 0], [0, 2, 0]].
+    """
+    lats = [depot[0]] + customers["lat"].tolist()
+    lons = [depot[1]] + customers["lon"].tolist()
+    return {
+        "name": name,
+        "customer_ids": customers["customer_id"].tolist(),   # original Kaggle IDs of nodes 1..n
+        "lats": lats,
+        "lons": lons,
+        "demand": [0.0] + customers["weight_kg"].tolist(),   # q_i, depot has no demand
+        "volume": [0.0] + customers["volume_dm3"].tolist(),
+        "capacity": capacity,                                 # Q
+        "dist": build_distance_matrix(lats, lons),            # d_ij
+    }
+
+
+def sample_instance(customers, n, seed, capacity=VEHICLE_CAPACITY_KG):
+    """Assumption A7: a reproducible random subset of n customers (same seed -> same subset)."""
+    rng = np.random.default_rng(seed)
+    chosen_rows = np.sort(rng.choice(len(customers), size=n, replace=False))
+    subset = customers.iloc[chosen_rows].reset_index(drop=True)
+    return make_instance(subset, depot_location(customers), capacity, name=f"n{n}_seed{seed}")
+
+
+def load_customers():
+    """Load the cleaned customer table, creating it from the raw workbook if needed."""
+    if PROCESSED_PATH.exists():
+        return pd.read_csv(PROCESSED_PATH)
+    customers = clean_customers(load_raw())
+    PROCESSED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    customers.to_csv(PROCESSED_PATH, index=False)
+    return customers
+
+
+def main():
+    raw = load_raw()
+    print(f"Raw sheet: {raw.shape[0]} rows x {raw.shape[1]} columns")
+    print(f"Rows without a CUSTOMER ID (filler rows): {raw['CUSTOMER ID'].isna().sum()}")
+
+    customers = clean_customers(raw)
+    PROCESSED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    customers.to_csv(PROCESSED_PATH, index=False)
+    print(f"\nClean customers: {len(customers)} rows -> saved to {PROCESSED_PATH.relative_to(REPO_ROOT)}")
+    print(customers.head().to_string(index=False))
+
+    print("\nSummary of the real data:")
+    print(customers[["lat", "lon", "weight_kg", "volume_dm3"]].describe().round(3).to_string())
+    print("Priority counts:", customers["priority"].value_counts().sort_index().to_dict())
+    print("Customers without a time slot:", customers["time_slot"].isna().sum())
+    total_weight = customers["weight_kg"].sum()
+    print(f"Total weight: {total_weight:.1f} kg | total volume: {customers['volume_dm3'].sum():.1f} dm3")
+    print(f"Minimum number of vans at Q = {VEHICLE_CAPACITY_KG:.0f} kg: {math.ceil(total_weight / VEHICLE_CAPACITY_KG)}")
+
+    depot = depot_location(customers)
+    print(f"\nDepot (assumed centroid): lat {depot[0]:.4f}, lon {depot[1]:.4f}")
+
+    full = make_instance(customers, depot, name="all_87")
+    dist = full["dist"]
+    print(f"Distance matrix: {dist.shape[0]} x {dist.shape[1]} (depot + {len(full['customer_ids'])} customers)")
+    print(f"  symmetric: {np.allclose(dist, dist.T)} | zero diagonal: {np.all(np.diag(dist) == 0)}")
+    off_diagonal = dist[~np.eye(len(dist), dtype=bool)]
+    print(f"  shortest {off_diagonal.min():.2f} km | longest {off_diagonal.max():.2f} km")
+    print(f"  depot -> customer {full['customer_ids'][0]}: {dist[0, 1]:.2f} km")
+    # Sanity check of the formula: 1 degree of latitude is about 111.19 km when R = 6371 km
+    print(f"  check: 1 degree of latitude = {haversine_km(0, 0, 1, 0):.2f} km (expected 111.19)")
+
+    small = sample_instance(customers, n=8, seed=1)
+    again = sample_instance(customers, n=8, seed=1)
+    print(f"\nSample instance {small['name']}: customers {small['customer_ids']}")
+    print(f"  same seed gives same subset: {small['customer_ids'] == again['customer_ids']}")
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+4. src/evaluate.py
+====================================================================================================
+"""Solution evaluation: route distance and feasibility checker.
+
+Owner: Luminda De Silva (Member 2)
+
+Every method (ILP, greedy, simulated annealing) is judged by the SAME functions in this file,
+so the comparison is fair and no method grades its own work.
+
+A solution is a list of routes. Each route is a list of node numbers that starts and ends at
+the depot (node 0), for example [[0, 3, 1, 0], [0, 2, 0]]. Node numbers follow the instance
+format created by src/data_prep.make_instance().
+
+Run from the repository root (runs a small hand-made test):
+    python -m src.evaluate
+"""
+
+import math
+
+TOLERANCE = 1e-6   # allow tiny floating-point rounding when comparing loads with Q
+
+
+def route_distance(route, dist):
+    """Length of one route in km: sum of d_ij over consecutive stops."""
+    return sum(dist[a][b] for a, b in zip(route, route[1:]))
+
+
+def total_distance(routes, dist):
+    """Objective value Z: total km driven by all vans."""
+    return sum(route_distance(route, dist) for route in routes)
+
+
+def route_load(route, demand):
+    """Total order weight (kg) carried on one route. The depot has demand 0."""
+    return sum(demand[node] for node in route)
+
+
+def check_feasible(routes, instance):
+    """Return a list of problems. An empty list means the solution is feasible.
+
+    Checks the CVRP constraints:
+      - every route starts and ends at the depot and does not pass through it in the middle,
+      - every customer 1..n is visited exactly once (no missing, no duplicates, no unknown nodes),
+      - no route carries more than the capacity Q.
+    """
+    demand = instance["demand"]
+    capacity = instance["capacity"]
+    n = len(demand) - 1
+    problems = []
+
+    visits = {}
+    for k, route in enumerate(routes, start=1):
+        if len(route) < 3:
+            problems.append(f"route {k} serves no customer: {route}")
+            continue
+        if route[0] != 0 or route[-1] != 0:
+            problems.append(f"route {k} does not start and end at the depot: {route}")
+        for node in route[1:-1]:
+            if node == 0:
+                problems.append(f"route {k} returns to the depot in the middle: {route}")
+            elif not 1 <= node <= n:
+                problems.append(f"route {k} has an unknown node {node}")
+            else:
+                visits[node] = visits.get(node, 0) + 1
+
+        load = sum(demand[node] for node in route if 0 <= node <= n)
+        if load > capacity + TOLERANCE:
+            problems.append(f"route {k} is overloaded: {load:.1f} kg > Q = {capacity:.1f} kg")
+
+    for customer in range(1, n + 1):
+        count = visits.get(customer, 0)
+        if count == 0:
+            problems.append(f"customer node {customer} is not visited")
+        elif count > 1:
+            problems.append(f"customer node {customer} is visited {count} times")
+
+    return problems
+
+
+def summarize(routes, instance):
+    """Key numbers for the results tables, computed the same way for every method."""
+    problems = check_feasible(routes, instance)
+    loads = [route_load(route, instance["demand"]) for route in routes]
+    summary = {
+        "distance_km": float(total_distance(routes, instance["dist"])),
+        "n_routes": len(routes),
+        "min_routes_needed": math.ceil(sum(instance["demand"]) / instance["capacity"] - TOLERANCE),
+        "max_load_kg": float(max(loads)) if loads else 0.0,
+        "feasible": not problems,
+        "n_problems": len(problems),
+    }
+    # Assumption A6: volume is not a model constraint, it is only reported after solving.
+    if "volume" in instance:
+        summary["max_volume_dm3"] = float(max(route_load(route, instance["volume"]) for route in routes)) if routes else 0.0
+    return summary
+
+
+def make_toy_instance():
+    """A tiny instance whose answers can be checked by hand (straight-line distances).
+
+        3 (0,4) ---- 2 (3,4)
+        |            |
+        0 (0,0) ---- 1 (3,0) ---- 4 (6,0)
+
+    Sides are 3 and 4 units, so the route 0-1-2-3-0 has length 3 + 4 + 3 + 4 = 14,
+    and the route 0-4-0 has length 6 + 6 = 12.
+    """
+    points = [(0, 0), (3, 0), (3, 4), (0, 4), (6, 0)]
+    dist = [[math.dist(p, q) for q in points] for p in points]
+    return {
+        "name": "toy",
+        "demand": [0, 40, 30, 20, 50],   # kg, node 0 is the depot
+        "capacity": 100,
+        "dist": dist,
+    }
+
+
+def main():
+    toy = make_toy_instance()
+
+    good = [[0, 1, 2, 3, 0], [0, 4, 0]]
+    print("Feasible solution:", good)
+    print("  distance:", total_distance(good, toy["dist"]), "(expected 26 = 14 + 12)")
+    print("  problems:", check_feasible(good, toy))
+    print("  summary:", summarize(good, toy))
+    assert total_distance(good, toy["dist"]) == 26
+    assert check_feasible(good, toy) == []
+
+    bad_cases = {
+        "overloaded (140 kg > 100 kg)": [[0, 1, 2, 3, 4, 0]],
+        "customers 3 and 4 missing": [[0, 1, 2, 0]],
+        "customer 2 visited twice": [[0, 1, 2, 0], [0, 2, 3, 4, 0]],
+        "route does not start at depot": [[1, 2, 3, 0], [0, 4, 0]],
+    }
+    for label, routes in bad_cases.items():
+        problems = check_feasible(routes, toy)
+        print(f"\nInfeasible solution ({label}): {routes}")
+        for problem in problems:
+            print("  -", problem)
+        assert problems, f"the checker missed: {label}"
+
+    print("\nAll checks passed.")
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+5. src/exact_ilp.py
+====================================================================================================
+"""Exact method: CVRP as an Integer Linear Program, solved by CBC (branch and bound) via PuLP.
+
+Owner: M.Z.M. Ruzbihan (Member 1)
+
+Model (two-index formulation with Miller-Tucker-Zemlin load constraints):
+    min  sum_{i != j} d_ij * x_ij                                    (1) total distance
+    s.t. sum_{j != i} x_ij = 1                  for every customer i  (2) leave once
+         sum_{i != j} x_ij = 1                  for every customer j  (3) enter once
+         sum_j x_0j = sum_i x_i0                                      (4) vans return to depot
+         u_j >= u_i + q_j - Q * (1 - x_ij)      for customers i != j  (5) MTZ load / no subtours
+         q_i <= u_i <= Q,  x_ij in {0, 1}                             (6) capacity and domains
+
+Run from the repository root:
+    python -m src.exact_ilp
+"""
+
+import re
+import tempfile
+import time
+from pathlib import Path
+
+import pulp
+
+from src.data_prep import load_customers, sample_instance
+
+DEFAULT_TIME_LIMIT_S = 300
+
+
+def build_model(instance):
+    """Create the PuLP model. Returns (model, x, u)."""
+    dist = instance["dist"]
+    demand = instance["demand"]
+    capacity = instance["capacity"]
+    n = len(demand) - 1
+
+    nodes = range(n + 1)           # V = {0, 1, ..., n}, node 0 is the depot
+    customers = range(1, n + 1)    # C = {1, ..., n}
+    arcs = [(i, j) for i in nodes for j in nodes if i != j]
+
+    model = pulp.LpProblem("CVRP", pulp.LpMinimize)
+
+    # Decision variables
+    x = pulp.LpVariable.dicts("x", arcs, cat="Binary")                    # x_ij: van drives i -> j
+    u = {i: pulp.LpVariable(f"u_{i}", lowBound=demand[i], upBound=capacity)  # (6) q_i <= u_i <= Q
+         for i in customers}
+
+    # (1) Objective: total distance driven
+    model += pulp.lpSum(dist[i][j] * x[(i, j)] for (i, j) in arcs)
+
+    for i in customers:
+        # (2) exactly one arc leaves customer i
+        model += pulp.lpSum(x[(i, j)] for j in nodes if j != i) == 1, f"leave_{i}"
+        # (3) exactly one arc enters customer i
+        model += pulp.lpSum(x[(j, i)] for j in nodes if j != i) == 1, f"enter_{i}"
+
+    # (4) every van that leaves the depot comes back
+    model += (pulp.lpSum(x[(0, j)] for j in customers)
+              == pulp.lpSum(x[(i, 0)] for i in customers)), "depot_balance"
+
+    # (5) MTZ: if the van goes i -> j, the load after j is at least the load after i plus q_j.
+    #     When x_ij = 0 the "- Q" term switches the constraint off.
+    for i in customers:
+        for j in customers:
+            if i != j:
+                model += u[j] >= u[i] + demand[j] - capacity * (1 - x[(i, j)]), f"mtz_{i}_{j}"
+
+    return model, x, u
+
+
+def extract_routes(x, n):
+    """Follow the arcs with x_ij = 1 from the depot to turn the solution into routes."""
+    next_node = {}
+    first_stops = []
+    for (i, j), var in x.items():
+        if var.value() is not None and var.value() > 0.5:
+            if i == 0:
+                first_stops.append(j)
+            else:
+                next_node[i] = j
+
+    routes = []
+    for start in sorted(first_stops):
+        route = [0, start]
+        while route[-1] != 0:
+            route.append(next_node[route[-1]])
+            if len(route) > n + 2:   # safety stop: should never happen if constraint (5) works
+                raise RuntimeError("route does not return to the depot")
+        routes.append(route)
+    return routes
+
+
+def read_cbc_log(log_path):
+    """Read the solver's final result line, lower bound and gap from the CBC log (if present)."""
+    text = Path(log_path).read_text(errors="ignore")
+    result = re.search(r"Result - (.+)", text)
+    lower_bound = re.search(r"Lower bound:\s+([-+0-9.eE]+)", text)
+    return {
+        "cbc_result": result.group(1).strip() if result else None,
+        "best_bound": float(lower_bound.group(1)) if lower_bound else None,
+    }
+
+
+def solve_cvrp_ilp(instance, time_limit=DEFAULT_TIME_LIMIT_S, verbose=False):
+    """Solve the instance with CBC. Returns a dictionary with routes, distance, status and runtime.
+
+    status is "optimal" when CBC proved optimality, "feasible" when the time limit stopped it
+    with a solution that is not proven optimal, and "no_solution" otherwise.
+    """
+    n = len(instance["demand"]) - 1
+    model, x, _ = build_model(instance)
+
+    log_path = Path(tempfile.gettempdir()) / f"cbc_{instance['name']}.log"
+    solver = pulp.PULP_CBC_CMD(msg=verbose, timeLimit=time_limit, logPath=str(log_path))
+
+    start = time.perf_counter()
+    model.solve(solver)
+    runtime = time.perf_counter() - start
+
+    log = read_cbc_log(log_path)
+    has_solution = model.sol_status in (pulp.LpSolutionOptimal, pulp.LpSolutionIntegerFeasible)
+    proven_optimal = (model.sol_status == pulp.LpSolutionOptimal
+                      and log["cbc_result"] is not None
+                      and log["cbc_result"].startswith("Optimal"))
+
+    if not has_solution:
+        return {"method": "ILP", "status": "no_solution", "routes": [], "distance_km": None,
+                "runtime_s": runtime, "best_bound": log["best_bound"], "gap_pct": None}
+
+    objective = pulp.value(model.objective)
+    best_bound = objective if proven_optimal else log["best_bound"]
+    gap_pct = None
+    if best_bound is not None and objective > 0:
+        gap_pct = 100 * (objective - best_bound) / objective
+
+    return {
+        "method": "ILP",
+        "status": "optimal" if proven_optimal else "feasible",
+        "routes": extract_routes(x, n),
+        "distance_km": objective,
+        "runtime_s": runtime,
+        "best_bound": best_bound,
+        "gap_pct": gap_pct,
+    }
+
+
+def main():
+    customers = load_customers()
+    instance = sample_instance(customers, n=8, seed=1)
+    print(f"Instance {instance['name']}: {len(instance['customer_ids'])} customers, "
+          f"Q = {instance['capacity']:.0f} kg, total demand = {sum(instance['demand']):.1f} kg")
+
+    model, _, _ = build_model(instance)
+    print(f"Model size: {len(model.variables())} variables, {len(model.constraints)} constraints")
+
+    result = solve_cvrp_ilp(instance)
+    print(f"Status: {result['status']} | distance: {result['distance_km']:.2f} km | "
+          f"runtime: {result['runtime_s']:.2f} s | gap: {result['gap_pct']:.2f} %")
+
+    for k, route in enumerate(result["routes"], start=1):
+        load = sum(instance["demand"][node] for node in route)
+        km = sum(instance["dist"][a][b] for a, b in zip(route, route[1:]))
+        kaggle_ids = [instance["customer_ids"][node - 1] for node in route[1:-1]]
+        print(f"  Van {k}: nodes {route} | Kaggle customers {kaggle_ids} | "
+              f"load {load:.1f} kg | {km:.2f} km")
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+6. src/heuristics.py
+====================================================================================================
+"""Heuristic method: greedy nearest-neighbour construction + Simulated Annealing improvement.
+
+Owner: Luminda De Silva (Member 2)
+
+Part 1, greedy (nearest neighbour):
+    1. Start a new van at the depot with an empty load.
+    2. Go to the NEAREST unvisited customer whose order still fits in the van (load + q_j <= Q).
+    3. Repeat step 2 until no remaining order fits, then return to the depot.
+    4. If customers are still unvisited, start another van (step 1).
+    Fast and always feasible, but short-sighted: each step only looks at the next stop.
+
+Part 2, Simulated Annealing (SA), starting from the greedy solution:
+    Repeat for a fixed number of iterations:
+        - make one small random change ("move"): relocate, swap or 2-opt,
+        - reject it if a van would be overloaded,
+        - delta = new distance - current distance,
+        - accept if delta <= 0, otherwise accept with probability exp(-delta / T),
+        - lower the temperature: T = cooling * T,
+        - remember the best solution ever seen.
+    A high T early on lets the search accept worse moves and escape local optima;
+    a low T at the end makes it behave like greedy hill-climbing.
+
+Run from the repository root:
+    python -m src.heuristics
+"""
+
+import math
+import random
+import time
+
+from src.evaluate import check_feasible, make_toy_instance, route_distance, summarize
+
+# Default SA settings. The temperature falls geometrically from T0 to T0 * FINAL_TEMP_RATIO.
+# The iteration budget was chosen once in a pilot run on all 87 customers (5 seeds each):
+# mean distance 2025 km at 50k, 1957 km at 100k, 1903 km at 300k, 1860 km at 1M iterations
+# (about 9 s per run). It is then kept fixed for every experiment.
+SA_ITERATIONS = 1_000_000
+SA_FINAL_TEMP_RATIO = 0.001
+SA_START_ACCEPT_PROB = 0.5     # T0 is set so an average worse move is accepted with this probability
+HISTORY_EVERY = 500            # record the cost every this many iterations (for convergence plots)
+
+
+# ----------------------------------------------------------------------------------------------
+# Part 1: greedy construction
+# ----------------------------------------------------------------------------------------------
+
+def nearest_neighbour(instance):
+    """Build routes with the capacity-aware nearest-neighbour rule. Returns a list of routes."""
+    dist = instance["dist"]
+    demand = instance["demand"]
+    capacity = instance["capacity"]
+    n = len(demand) - 1
+
+    too_big = [c for c in range(1, n + 1) if demand[c] > capacity]
+    if too_big:
+        raise ValueError(f"customer nodes {too_big} have an order larger than Q, no solution exists")
+
+    unvisited = set(range(1, n + 1))
+    routes = []
+    while unvisited:
+        route = [0]
+        load = 0.0
+        current = 0
+        while True:
+            fits = [c for c in unvisited if load + demand[c] <= capacity]
+            if not fits:
+                break
+            # nearest customer that fits; ties broken by the smaller node number (deterministic)
+            nearest = min(fits, key=lambda c: (dist[current][c], c))
+            route.append(nearest)
+            load += demand[nearest]
+            unvisited.remove(nearest)
+            current = nearest
+        route.append(0)
+        routes.append(route)
+    return routes
+
+
+def solve_greedy(instance):
+    """Run the greedy heuristic and return results in the same format as the ILP."""
+    start = time.perf_counter()
+    routes = nearest_neighbour(instance)
+    runtime = time.perf_counter() - start
+    return {
+        "method": "Greedy",
+        "status": "heuristic",
+        "routes": routes,
+        "distance_km": summarize(routes, instance)["distance_km"],
+        "runtime_s": runtime,
+    }
+
+
+# ----------------------------------------------------------------------------------------------
+# Part 2: simulated annealing
+# ----------------------------------------------------------------------------------------------
+# Inside SA a route is stored WITHOUT the depot, e.g. [3, 1] means 0 -> 3 -> 1 -> 0.
+# This makes the moves simpler. The depot is added back before returning the solution.
+
+def tour_length(customers, dist):
+    """Distance of the route depot -> customers -> depot."""
+    return route_distance([0] + customers + [0], dist)
+
+
+def random_move(routes, rng):
+    """Propose one random neighbour. Returns (move name, {route index: new customer list}).
+
+    Only the routes that change are returned, so the change in distance can be computed
+    from those routes alone. An empty new list means that route disappears (one van fewer).
+    """
+    move = rng.choice(("relocate", "swap", "2-opt"))
+
+    if move == "relocate":
+        # take one customer out of route a and insert it at any position of route b (b may equal a)
+        a = rng.randrange(len(routes))
+        b = rng.randrange(len(routes))
+        i = rng.randrange(len(routes[a]))
+        customer = routes[a][i]
+        new_a = routes[a][:i] + routes[a][i + 1:]
+        if a == b:
+            j = rng.randrange(len(new_a) + 1)
+            return move, {a: new_a[:j] + [customer] + new_a[j:]}
+        j = rng.randrange(len(routes[b]) + 1)
+        return move, {a: new_a, b: routes[b][:j] + [customer] + routes[b][j:]}
+
+    if move == "swap":
+        # exchange two customers (in the same route or in two different routes)
+        a = rng.randrange(len(routes))
+        b = rng.randrange(len(routes))
+        i = rng.randrange(len(routes[a]))
+        j = rng.randrange(len(routes[b]))
+        if a == b:
+            new_a = routes[a][:]
+            new_a[i], new_a[j] = new_a[j], new_a[i]
+            return move, {a: new_a}
+        new_a, new_b = routes[a][:], routes[b][:]
+        new_a[i], new_b[j] = routes[b][j], routes[a][i]
+        return move, {a: new_a, b: new_b}
+
+    # 2-opt: reverse the order of a segment inside one route (removes crossing lines)
+    a = rng.randrange(len(routes))
+    i, j = sorted(rng.sample(range(len(routes[a]) + 1), 2)) if len(routes[a]) > 1 else (0, 1)
+    return move, {a: routes[a][:i] + routes[a][i:j][::-1] + routes[a][j:]}
+
+
+def fits_capacity(changed, demand, capacity):
+    """True if every changed route respects the capacity Q."""
+    return all(sum(demand[c] for c in customers) <= capacity + 1e-9 for customers in changed.values())
+
+
+def delta_of(routes, changed, dist):
+    """Change in total distance if the changed routes replace the old ones."""
+    old = sum(tour_length(routes[k], dist) for k in changed)
+    new = sum(tour_length(customers, dist) for customers in changed.values() if customers)
+    return new - old
+
+
+def estimate_start_temperature(routes, instance, rng, samples=500):
+    """Pick T0 so that an average worse move is accepted with probability SA_START_ACCEPT_PROB.
+
+    From exp(-avg_delta / T0) = p we get T0 = -avg_delta / ln(p).
+    """
+    worse = []
+    for _ in range(samples):
+        _, changed = random_move(routes, rng)
+        if fits_capacity(changed, instance["demand"], instance["capacity"]):
+            delta = delta_of(routes, changed, instance["dist"])
+            if delta > 0:
+                worse.append(delta)
+    average_worse = sum(worse) / len(worse) if worse else 1.0
+    return -average_worse / math.log(SA_START_ACCEPT_PROB)
+
+
+def simulated_annealing(instance, initial_routes, seed=0, iterations=SA_ITERATIONS,
+                        final_temp_ratio=SA_FINAL_TEMP_RATIO):
+    """Improve a feasible solution with SA. Returns (best routes, best distance, history, T0).
+
+    history is a list of (iteration, temperature, current distance, best distance).
+    """
+    rng = random.Random(seed)   # own random generator: the same seed always gives the same result
+    dist = instance["dist"]
+    demand = instance["demand"]
+    capacity = instance["capacity"]
+
+    routes = [route[1:-1] for route in initial_routes]   # drop the depot inside SA
+    current = sum(tour_length(r, dist) for r in routes)
+    best_routes, best = [r[:] for r in routes], current
+
+    start_temp = estimate_start_temperature(routes, instance, rng)
+    cooling = final_temp_ratio ** (1 / iterations)        # so T ends at start_temp * final_temp_ratio
+    temperature = start_temp
+    history = [(0, temperature, current, best)]
+
+    for iteration in range(1, iterations + 1):
+        _, changed = random_move(routes, rng)
+
+        if fits_capacity(changed, demand, capacity):
+            delta = delta_of(routes, changed, dist)
+            # Metropolis acceptance rule
+            if delta <= 0 or rng.random() < math.exp(-delta / temperature):
+                for k, customers in changed.items():
+                    routes[k] = customers
+                routes = [r for r in routes if r]               # remove a van that became empty
+                current += delta
+                if current < best - 1e-9:
+                    best_routes, best = [r[:] for r in routes], current
+
+        temperature *= cooling
+        if iteration % HISTORY_EVERY == 0:
+            history.append((iteration, temperature, current, best))
+
+    best_with_depot = [[0] + r + [0] for r in best_routes]
+    return best_with_depot, best, history, start_temp
+
+
+def solve_sa(instance, seed=0, iterations=SA_ITERATIONS):
+    """Greedy start + SA. Returns results in the same format as the ILP and greedy methods.
+
+    The runtime includes building the greedy start, because SA cannot run without it.
+    """
+    start = time.perf_counter()
+    initial = nearest_neighbour(instance)
+    routes, _, history, start_temp = simulated_annealing(instance, initial, seed=seed, iterations=iterations)
+    runtime = time.perf_counter() - start
+    return {
+        "method": "SA",
+        "status": "heuristic",
+        "routes": routes,
+        "distance_km": summarize(routes, instance)["distance_km"],   # recomputed by the shared judge
+        "runtime_s": runtime,
+        "seed": seed,
+        "iterations": iterations,
+        "start_temperature": start_temp,
+        "history": history,
+    }
+
+
+def main():
+    from src.data_prep import depot_location, load_customers, make_instance, sample_instance
+
+    # 1. Greedy on the hand-checkable toy example (see make_toy_instance in src/evaluate.py), Q = 100 kg.
+    #    From 0 the nearest is 1 (3 km, load 40). From 1 the nearest is 4 (3 km, load 90).
+    #    Nothing else fits, so return to 0: route [0, 1, 4, 0] = 3 + 3 + 6 = 12.
+    #    New van: nearest is 3 (4 km, load 20), then 2 (3 km, load 50), back to 0 (5 km):
+    #    route [0, 3, 2, 0] = 12. Total = 24.
+    toy = make_toy_instance()
+    toy_routes = nearest_neighbour(toy)
+    print("Toy instance greedy routes:", toy_routes, "| distance:", summarize(toy_routes, toy)["distance_km"],
+          "(expected [[0, 1, 4, 0], [0, 3, 2, 0]] and 24.0)")
+    assert toy_routes == [[0, 1, 4, 0], [0, 3, 2, 0]]
+    assert check_feasible(toy_routes, toy) == []
+
+    # 2. SA on a small real instance whose proven ILP optimum is 557.91 km (see notebook 01).
+    small = sample_instance(load_customers(), n=10, seed=3, capacity=600)
+    greedy_small = solve_greedy(small)
+    sa_small = solve_sa(small, seed=0, iterations=20_000)
+    print(f"\nInstance {small['name']} (Q = 600 kg, proven optimum 557.91 km):")
+    print(f"  greedy {greedy_small['distance_km']:.2f} km | SA {sa_small['distance_km']:.2f} km "
+          f"in {sa_small['runtime_s']:.2f} s")
+    assert check_feasible(sa_small["routes"], small) == []
+    assert sa_small["distance_km"] >= 557.91 - 0.01, "SA cannot beat a proven optimum: bug!"
+
+    # 3. Greedy and SA on all 87 real customers, Q = 1,000 kg.
+    customers = load_customers()
+    full = make_instance(customers, depot_location(customers), name="all_87")
+    greedy = solve_greedy(full)
+    sa = solve_sa(full, seed=0)
+    improvement = 100 * (greedy["distance_km"] - sa["distance_km"]) / greedy["distance_km"]
+    print(f"\nAll 87 customers (Q = 1,000 kg):")
+    print(f"  greedy: {greedy['distance_km']:.2f} km, {len(greedy['routes'])} vans")
+    print(f"  SA:     {sa['distance_km']:.2f} km, {len(sa['routes'])} vans, {sa['runtime_s']:.1f} s, "
+          f"T0 = {sa['start_temperature']:.2f}, {sa['iterations']} iterations")
+    print(f"  SA improves the greedy solution by {improvement:.1f} %")
+    print("  summary:", summarize(sa["routes"], full))
+    assert check_feasible(sa["routes"], full) == []
+    assert sa["distance_km"] <= greedy["distance_km"] + 1e-9
+
+    # 4. Reproducibility: the same seed must give exactly the same answer.
+    again = solve_sa(small, seed=0, iterations=20_000)
+    print(f"\nSame seed, same result: {again['routes'] == sa_small['routes']}")
+    assert again["routes"] == sa_small["routes"]
+
+    print("\nAll checks passed.")
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+7. src/plots.py
+====================================================================================================
+"""All result figures for the report and the video, made from the CSV files in results/tables/.
+
+Owner: Luminda De Silva (Member 2)
+
+Each method always has the same colour AND marker shape, so the figures can be read in
+black-and-white print and by colour-blind readers:
+    ILP = blue square, Greedy = orange triangle, SA = aqua circle.
+
+Run from the repository root (after run_comparison and run_heuristic_analysis):
+    python -m src.plots
+"""
+
+import json
+import math
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+from src.data_prep import REPO_ROOT, load_customers, sample_instance, depot_location, make_instance
+
+TABLES = REPO_ROOT / "results" / "tables"
+FIGURES = REPO_ROOT / "results" / "figures"
+
+STYLE = {
+    "ILP": {"color": "#2a78d6", "marker": "s", "label": "ILP (CBC)"},
+    "Greedy": {"color": "#eb6834", "marker": "^", "label": "Greedy"},
+    "SA": {"color": "#1baf7a", "marker": "o", "label": "Simulated annealing"},
+}
+INK = "#0b0b0b"
+MUTED = "#52514e"
+GRID = "#e4e3df"
+
+plt.rcParams.update({
+    "figure.dpi": 110, "savefig.dpi": 200, "font.size": 10,
+    "axes.edgecolor": MUTED, "axes.labelcolor": INK, "xtick.color": MUTED, "ytick.color": MUTED,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8, "axes.axisbelow": True,
+    "legend.frameon": False, "lines.linewidth": 2,
+})
+
+
+def save(fig, name):
+    FIGURES.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(FIGURES / name, bbox_inches="tight")
+    plt.close(fig)
+    print(f"saved results/figures/{name}")
+
+
+def draw_routes(ax, instance, routes, colour, title):
+    """Draw every route of a solution in one colour; the depot is a black square."""
+    lats, lons = instance["lats"], instance["lons"]
+    for route in routes:
+        ax.plot([lons[n] for n in route], [lats[n] for n in route], "-", color=colour, linewidth=1.4, alpha=0.9)
+    ax.scatter(lons[1:], lats[1:], s=18, color=colour, edgecolor="white", linewidth=0.6, zorder=3)
+    ax.scatter(lons[0], lats[0], marker="s", s=70, color=INK, zorder=4, label="Depot")
+    ax.set_title(title, color=INK, fontsize=10)
+    ax.set_xlabel("Longitude (degrees)")
+    ax.set_ylabel("Latitude (degrees)")
+    ax.set_aspect(1 / math.cos(math.radians(lats[0])))
+
+
+def best_routes(runs, method, distance_column, instance=None):
+    """Routes of the shortest run of a method (optionally on one instance)."""
+    rows = runs[runs["method"] == method]
+    if instance is not None:
+        rows = rows[rows["instance"] == instance]
+    best = rows.loc[rows[distance_column].idxmin()]
+    return json.loads(best["routes"]), best
+
+
+# ----------------------------------------------------------------------------------------------
+# E1 / E2 figures (data from src/run_comparison.py)
+# ----------------------------------------------------------------------------------------------
+
+def plot_greedy_vs_optimal_routes(e1_runs, customers):
+    """Greedy plan vs the proven optimal plan on the E1 instance where greedy is worst."""
+    summary = pd.read_csv(TABLES / "e1_summary.csv")
+    worst = summary.loc[summary["greedy_gap_to_opt_pct"].idxmax()]
+    n, seed = int(worst["n_customers"]), int(worst["instance"].split("seed")[1])
+    instance = sample_instance(customers, n=n, seed=seed)
+    greedy_routes, greedy = best_routes(e1_runs, "Greedy", "distance_km", instance=worst["instance"])
+    ilp_routes, ilp = best_routes(e1_runs, "ILP", "distance_km", instance=worst["instance"])
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.6), sharex=True, sharey=True)
+    draw_routes(axes[0], instance, greedy_routes, STYLE["Greedy"]["color"],
+                f"Greedy: {greedy['distance_km']:.1f} km")
+    draw_routes(axes[1], instance, ilp_routes, STYLE["ILP"]["color"],
+                f"Proven optimum (ILP; SA finds the same): {ilp['distance_km']:.1f} km")
+    fig.suptitle(f"Instance {worst['instance']}: greedy is {worst['greedy_gap_to_opt_pct']:.1f} % longer "
+                 f"than the optimum", color=INK)
+    save(fig, "f3_greedy_vs_optimal_routes.png")
+
+
+def plot_runtime_vs_size(e1_runs, e2_runs):
+    """Runtime against number of customers, log scale. Hollow ILP markers = stopped by the time limit."""
+    runs = pd.concat([e1_runs, e2_runs])
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    for method in ("ILP", "Greedy", "SA"):
+        per_n = runs[runs["method"] == method].groupby("n_customers")["runtime_s"].mean()
+        style = STYLE[method]
+        ax.plot(per_n.index, per_n.values, color=style["color"], linewidth=2, alpha=0.6)
+        if method == "ILP":
+            proven = runs[(runs["method"] == "ILP")].groupby("n_customers")["status"].apply(
+                lambda s: (s == "optimal").all())
+            ax.scatter(per_n.index[proven.values], per_n.values[proven.values], marker="s", s=45,
+                       color=style["color"], zorder=3, label="ILP, proven optimal")
+            ax.scatter(per_n.index[~proven.values], per_n.values[~proven.values], marker="s", s=45,
+                       facecolor="white", edgecolor=style["color"], linewidth=1.8, zorder=3,
+                       label="ILP, stopped at 300 s limit")
+        else:
+            ax.scatter(per_n.index, per_n.values, marker=style["marker"], s=45, color=style["color"],
+                       zorder=3, label=style["label"] + (" (mean of seeds)" if method == "SA" else ""))
+    ax.axhline(300, color=MUTED, linestyle="--", linewidth=1)
+    ax.text(runs["n_customers"].min(), 300, "300 s time limit", va="bottom", ha="left", color=MUTED, fontsize=9)
+    ax.set_yscale("log")
+    ax.set_xlabel("Number of customers (n)")
+    ax.set_ylabel("Runtime (seconds, log scale)")
+    ax.set_title("Runtime grows explosively for the exact method", color=INK)
+    ax.legend(loc="center right")
+    save(fig, "f4_runtime_vs_size.png")
+
+
+def plot_distance_vs_size(e2_summary):
+    """E2: total distance of each method as the instance grows."""
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    series = {"ILP": "ilp_km", "Greedy": "greedy_km", "SA": "sa_mean_km"}
+    for method, column in series.items():
+        style = STYLE[method]
+        label = {"ILP": "ILP best plan after 300 s", "Greedy": "Greedy", "SA": "SA (mean of 5 seeds)"}[method]
+        ax.plot(e2_summary["n_customers"], e2_summary[column], marker=style["marker"], markersize=7,
+                color=style["color"], label=label)
+        last = e2_summary.iloc[-1]
+        ax.annotate(f"{last[column]:.0f} km", (last["n_customers"], last[column]), xytext=(6, 0),
+                    textcoords="offset points", va="center", color=INK, fontsize=9)
+    ax.set_xlabel("Number of customers (n)")
+    ax.set_ylabel("Total distance (km)")
+    ax.set_title("E2: plan quality when the ILP can no longer prove optimality", color=INK)
+    ax.legend(loc="upper left")
+    ax.set_xlim(right=e2_summary["n_customers"].max() * 1.12)
+    save(fig, "f5_distance_vs_size.png")
+
+
+def plot_gap_to_optimum(e1_summary):
+    """E1: how far greedy and SA are from the proven optimum on each small instance."""
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    x = range(len(e1_summary))
+    # small sideways offset so a marker at 0 % never hides the other method's marker
+    for offset, (method, column) in ((-0.15, ("Greedy", "greedy_gap_to_opt_pct")),
+                                     (0.15, ("SA", "sa_mean_gap_to_opt_pct"))):
+        style = STYLE[method]
+        label = style["label"] + (" (mean of 10 seeds)" if method == "SA" else "")
+        ax.scatter([i + offset for i in x], e1_summary[column].clip(lower=0), marker=style["marker"], s=55,
+                   color=style["color"], zorder=3, label=label)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(e1_summary["instance"], rotation=45, ha="right")
+    ax.set_ylabel("Gap to proven optimum (%)")
+    ax.set_title("E1: SA reached the proven optimum in all 120 runs; greedy did not", color=INK)
+    ax.legend(loc="upper left")
+    save(fig, "f6_gap_to_optimum.png")
+
+
+# ----------------------------------------------------------------------------------------------
+# E3 / E4 / E5 figures (data from src/run_heuristic_analysis.py)
+# ----------------------------------------------------------------------------------------------
+
+def plot_sa_convergence(history):
+    """E4: current and best distance over the iterations (top) and the temperature (bottom)."""
+    run = history[(history["instance"] == "all_87_Q1000") & (history["sa_seed"] == 0)]
+    fig, (top, bottom) = plt.subplots(2, 1, figsize=(8, 5.6), sharex=True, gridspec_kw={"height_ratios": [3, 1.4]})
+    top.plot(run["iteration"], run["current_distance"], color=STYLE["SA"]["color"], linewidth=1.2, alpha=0.75,
+             label="Current solution")
+    top.plot(run["iteration"], run["best_distance"], color=INK, linewidth=2, label="Best so far")
+    top.annotate(f"start (greedy): {run['current_distance'].iloc[0]:.0f} km",
+                 (0, run["current_distance"].iloc[0]), xytext=(4, -8), textcoords="offset points",
+                 color=INK, fontsize=9, va="top", ha="left",
+                 bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "none"})
+    top.annotate(f"final best: {run['best_distance'].iloc[-1]:.0f} km",
+                 (run["iteration"].iloc[-1], run["best_distance"].iloc[-1]), xytext=(-4, 10),
+                 textcoords="offset points", color=INK, fontsize=9, ha="right")
+    top.set_ylabel("Total distance (km)")
+    top.set_title("E4: simulated annealing on all 87 customers (seed 0, Q = 1,000 kg)", color=INK)
+    top.legend(loc="upper right")
+    bottom.plot(run["iteration"], run["temperature"], color=MUTED, linewidth=1.6)
+    bottom.set_yscale("log")
+    bottom.set_ylabel("Temperature T")
+    bottom.set_xlabel("Iteration")
+    bottom.xaxis.set_major_formatter(plt.FuncFormatter(lambda value, _: f"{value / 1000:.0f}k"))
+    save(fig, "f7_sa_convergence.png")
+
+
+def plot_sa_seed_spread(e3_runs):
+    """E4: final SA distance for each of the 10 seeds, one small panel per capacity."""
+    sa = e3_runs[(e3_runs["experiment"] == "E3") & (e3_runs["method"] == "SA")]
+    capacities = sorted(sa["capacity"].unique())
+    fig, axes = plt.subplots(1, len(capacities), figsize=(10, 3.8))
+    for ax, capacity in zip(axes, capacities):
+        values = sa[sa["capacity"] == capacity]["distance"]
+        ax.boxplot(values, widths=0.5, medianprops={"color": INK}, boxprops={"color": MUTED},
+                   whiskerprops={"color": MUTED}, capprops={"color": MUTED}, showfliers=False)
+        ax.scatter([1] * len(values), values, color=STYLE["SA"]["color"], edgecolor="white", s=40, zorder=3)
+        ax.set_title(f"Q = {capacity:.0f} kg", color=INK, fontsize=10)
+        ax.set_xticks([])
+        spread = 100 * (values.max() - values.min()) / values.min()
+        ax.set_xlabel(f"best {values.min():.0f} · worst {values.max():.0f}\n(spread {spread:.1f} %)", color=MUTED)
+    axes[0].set_ylabel("SA final distance (km)")
+    fig.suptitle("E4: variation of SA across 10 random seeds (all 87 customers)", color=INK)
+    save(fig, "f8_sa_seed_spread.png")
+
+
+def plot_capacity_sensitivity(e3_summary):
+    """E3: van capacity vs total distance and vs number of vans (two panels, never a dual axis)."""
+    data = e3_summary[e3_summary["experiment"] == "E3"]
+    fig, (left, right) = plt.subplots(1, 2, figsize=(10, 4))
+    for method in ("Greedy", "SA"):
+        rows = data[data["method"] == method]
+        style = STYLE[method]
+        label = style["label"] + (" (best of 10 seeds)" if method == "SA" else "")
+        left.plot(rows["capacity"], rows["best_distance"], marker=style["marker"], markersize=7,
+                  color=style["color"], label=label)
+        right.plot(rows["capacity"], rows["routes_min"], marker=style["marker"], markersize=7,
+                   color=style["color"], label=style["label"])
+    lower = data[data["method"] == "SA"]
+    right.plot(lower["capacity"], lower["min_routes_needed"], linestyle="--", color=MUTED, linewidth=1.2,
+               label="Lower bound ⌈Σq / Q⌉")
+    left.set_xlabel("Van capacity Q (kg)")
+    left.set_ylabel("Total distance (km)")
+    left.set_title("Distance", color=INK)
+    left.legend()
+    right.set_xlabel("Van capacity Q (kg)")
+    right.set_ylabel("Number of vans used")
+    right.set_title("Vans", color=INK)
+    right.legend()
+    for ax in (left, right):
+        ax.set_xticks(sorted(data["capacity"].unique()))
+    fig.suptitle("E3: effect of van capacity (all 87 customers)", color=INK)
+    save(fig, "f9_capacity_sensitivity.png")
+
+
+def plot_benchmark(e5_runs, optimum):
+    """E5: every method's result on A-n32-k5 compared with the published optimum."""
+    data = e5_runs[e5_runs["experiment"] == "E5"]
+    fig, ax = plt.subplots(figsize=(7.5, 3.8))
+    rows = [("ILP", "ILP after 300 s"), ("Greedy", "Greedy"), ("SA", "SA, 10 seeds")]
+    for y, (method, label) in enumerate(rows):
+        values = data[data["method"] == method]["distance"].dropna()
+        style = STYLE[method]
+        if method == "ILP" and data[data["method"] == "ILP"]["status"].iloc[0] != "optimal":
+            ax.scatter(values, [y] * len(values), marker="s", s=60, facecolor="white",
+                       edgecolor=style["color"], linewidth=1.8, zorder=3)
+        else:
+            ax.scatter(values, [y] * len(values), marker=style["marker"], s=60, color=style["color"],
+                       edgecolor="white", zorder=3, alpha=0.85)
+        best = values.min()
+        label = f"best {best:.0f}"
+        if method == "SA":
+            label += f" ({int((abs(values - optimum) < 1e-6).sum())} of {len(values)} runs at the optimum)"
+        ax.annotate(label, (best, y), xytext=(6, -14), textcoords="offset points", ha="left", color=INK,
+                    fontsize=9)
+    ax.axvline(optimum, color=INK, linestyle="--", linewidth=1.2)
+    ax.text(optimum, len(rows) - 0.45, f" published optimum {optimum:.0f}", color=INK, fontsize=9)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([label for _, label in rows])
+    ax.set_ylim(-0.6, len(rows) - 0.2)
+    ax.set_xlabel("Total distance (rounded Euclidean units)")
+    ax.set_title("E5: benchmark A-n32-k5 (31 customers, Q = 100)", color=INK)
+    save(fig, "f10_benchmark.png")
+
+
+def plot_sa_routes_all87(e3_runs, customers):
+    """Greedy vs best SA plan on all 87 customers (Q = 1,000 kg)."""
+    instance = make_instance(customers, depot_location(customers), name="all_87")
+    greedy_routes, greedy = best_routes(e3_runs, "Greedy", "distance", instance="all_87_Q1000")
+    sa_routes, sa = best_routes(e3_runs, "SA", "distance", instance="all_87_Q1000")
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5.4), sharex=True, sharey=True)
+    draw_routes(axes[0], instance, greedy_routes, STYLE["Greedy"]["color"],
+                f"Greedy: {greedy['distance']:.0f} km, {len(greedy_routes)} vans")
+    draw_routes(axes[1], instance, sa_routes, STYLE["SA"]["color"],
+                f"Simulated annealing (best seed): {sa['distance']:.0f} km, {len(sa_routes)} vans")
+    fig.suptitle("All 87 customers, Q = 1,000 kg", color=INK)
+    save(fig, "f11_routes_all87_greedy_vs_sa.png")
+
+
+def main():
+    customers = load_customers()
+
+    if (TABLES / "e1_runs.csv").exists():
+        e1_runs = pd.read_csv(TABLES / "e1_runs.csv")
+        e2_runs = pd.read_csv(TABLES / "e2_runs.csv")
+        plot_greedy_vs_optimal_routes(e1_runs, customers)
+        plot_runtime_vs_size(e1_runs, e2_runs)
+        plot_distance_vs_size(pd.read_csv(TABLES / "e2_summary.csv"))
+        plot_gap_to_optimum(pd.read_csv(TABLES / "e1_summary.csv"))
+    else:
+        print("E1/E2 tables missing: run `python -m src.run_comparison` first")
+
+    if (TABLES / "e3_e5_runs.csv").exists():
+        runs = pd.read_csv(TABLES / "e3_e5_runs.csv")
+        summary = pd.read_csv(TABLES / "e3_e5_summary.csv")
+        optimum = summary.loc[summary["experiment"] == "E5", "published_optimum"].iloc[0]
+        plot_sa_convergence(pd.read_csv(TABLES / "e4_sa_history.csv"))
+        plot_sa_seed_spread(runs)
+        plot_capacity_sensitivity(summary)
+        plot_benchmark(runs, optimum)
+        plot_sa_routes_all87(runs, customers)
+    else:
+        print("E3-E5 tables missing: run `python -m src.run_heuristic_analysis` first")
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+8. src/run_comparison.py
+====================================================================================================
+"""Experiments E1 and E2: exact ILP vs greedy vs simulated annealing.
+
+Owner: M.Z.M. Ruzbihan (Member 1)
+
+E1 (quality on small instances): n in {5, 8, 10, 12}, 3 random customer subsets per size.
+    Every method solves the same instance. The ILP gives the proven optimum, so we can measure
+    how far the heuristics are from it (optimality gap).
+E2 (scalability): n in {15, 20, 30, 45, 60, 87}, one subset per size (87 = all customers).
+    The ILP gets the same time limit; we record whether it can still prove optimality,
+    its best plan, and its lower bound.
+
+Fairness rules:
+    - same instance, distance matrix, depot and Q for every method,
+    - every result is re-scored by src/evaluate.py (no method grades its own work),
+    - SA uses a fixed iteration budget and 10 (E1) or 5 (E2) fixed seeds,
+    - all runs are sequential on the same machine (see results/tables/environment.txt).
+
+Run from the repository root (takes roughly 30-45 minutes because of the ILP time limits):
+    python -m src.run_comparison          # E1 and E2
+    python -m src.run_comparison e1       # only E1
+    python -m src.run_comparison e2       # only E2
+"""
+
+import json
+import os
+import platform
+import statistics
+import sys
+
+import pandas as pd
+import pulp
+
+from src.data_prep import REPO_ROOT, VEHICLE_CAPACITY_KG, load_customers, sample_instance
+from src.evaluate import summarize
+from src.exact_ilp import solve_cvrp_ilp
+from src.heuristics import SA_ITERATIONS, solve_greedy, solve_sa
+
+TABLES = REPO_ROOT / "results" / "tables"
+
+ILP_TIME_LIMIT_S = 300
+E1_SIZES = [5, 8, 10, 12]
+E1_SUBSET_SEEDS = [1, 2, 3]
+E1_SA_SEEDS = list(range(10))
+E2_SIZES = [15, 20, 30, 45, 60, 87]
+E2_SUBSET_SEED = 1
+E2_SA_SEEDS = list(range(5))
+
+
+def result_row(experiment, instance, subset_seed, result, sa_seed=None):
+    """One CSV row. Distance and feasibility come from the shared judge in src/evaluate.py."""
+    judged = summarize(result["routes"], instance) if result["routes"] else {}
+    return {
+        "experiment": experiment,
+        "instance": instance["name"],
+        "n_customers": len(instance["customer_ids"]),
+        "subset_seed": subset_seed,
+        "capacity_kg": instance["capacity"],
+        "method": result["method"],
+        "sa_seed": sa_seed,
+        "status": result["status"],
+        "distance_km": judged.get("distance_km"),
+        "runtime_s": result["runtime_s"],
+        "n_routes": judged.get("n_routes"),
+        "min_routes_needed": judged.get("min_routes_needed"),
+        "max_load_kg": judged.get("max_load_kg"),
+        "max_volume_dm3": judged.get("max_volume_dm3"),
+        "feasible": judged.get("feasible"),   # empty when the ILP found no plan within the time limit
+        "ilp_lower_bound_km": result.get("best_bound"),
+        "routes": json.dumps(result["routes"]),
+    }
+
+
+def run_all_methods(experiment, instance, subset_seed, sa_seeds):
+    """Solve one instance with ILP, greedy and SA (one run per SA seed). Returns CSV rows."""
+    rows = []
+    ilp = solve_cvrp_ilp(instance, time_limit=ILP_TIME_LIMIT_S)
+    rows.append(result_row(experiment, instance, subset_seed, ilp))
+    print(f"  ILP    : {ilp['status']:<11} {ilp['distance_km'] or float('nan'):9.2f} km  {ilp['runtime_s']:7.2f} s",
+          flush=True)
+
+    greedy = solve_greedy(instance)
+    rows.append(result_row(experiment, instance, subset_seed, greedy))
+    print(f"  Greedy : {greedy['distance_km']:21.2f} km  {greedy['runtime_s']:7.3f} s", flush=True)
+
+    sa_distances = []
+    for seed in sa_seeds:
+        sa = solve_sa(instance, seed=seed)
+        rows.append(result_row(experiment, instance, subset_seed, sa, sa_seed=seed))
+        sa_distances.append(sa["distance_km"])
+    print(f"  SA     : mean {statistics.mean(sa_distances):16.2f} km  (best {min(sa_distances):.2f}, "
+          f"{len(sa_seeds)} seeds)", flush=True)
+    return rows
+
+
+def summarize_instances(runs):
+    """One summary row per instance: ILP vs greedy vs SA (mean over seeds)."""
+    summary = []
+    for name, group in runs.groupby("instance", sort=False):
+        ilp = group[group["method"] == "ILP"].iloc[0]
+        greedy = group[group["method"] == "Greedy"].iloc[0]
+        sa = group[group["method"] == "SA"]
+
+        proven = ilp["status"] == "optimal"
+        bound = ilp["ilp_lower_bound_km"]
+        reference = ilp["distance_km"] if proven else None   # gaps to the optimum only when it is proven
+
+        def gap(value, ref):
+            return None if ref is None or pd.isna(ref) or pd.isna(value) else 100 * (value - ref) / ref
+
+        summary.append({
+            "experiment": ilp["experiment"],
+            "instance": name,
+            "n_customers": ilp["n_customers"],
+            "capacity_kg": ilp["capacity_kg"],
+            "min_routes_needed": greedy["min_routes_needed"],
+            "ilp_status": ilp["status"],
+            "ilp_km": ilp["distance_km"],
+            "ilp_lower_bound_km": bound,
+            "ilp_time_s": ilp["runtime_s"],
+            "greedy_km": greedy["distance_km"],
+            "greedy_time_s": greedy["runtime_s"],
+            "sa_mean_km": sa["distance_km"].mean(),
+            "sa_best_km": sa["distance_km"].min(),
+            "sa_worst_km": sa["distance_km"].max(),
+            "sa_std_km": sa["distance_km"].std(),
+            "sa_mean_time_s": sa["runtime_s"].mean(),
+            "greedy_gap_to_opt_pct": gap(greedy["distance_km"], reference),
+            "sa_mean_gap_to_opt_pct": gap(sa["distance_km"].mean(), reference),
+            "sa_runs_at_optimum": int((abs(sa["distance_km"] - reference) < 1e-6).sum()) if proven else None,
+            # When the ILP is not proven optimal, the lower bound still limits how bad a plan can be:
+            # the true optimum lies between the bound and the best plan found.
+            "sa_best_gap_to_bound_pct": gap(sa["distance_km"].min(), bound),
+            "sa_vs_ilp_best_pct": gap(sa["distance_km"].mean(), ilp["distance_km"]),
+            "sa_routes": int(sa["n_routes"].iloc[0]),
+            "all_feasible": bool(group["feasible"].dropna().all()),
+        })
+    return pd.DataFrame(summary)
+
+
+def write_environment():
+    """Record the machine and library versions, so the timings can be interpreted."""
+    lines = [
+        f"platform: {platform.platform()}",
+        f"processor: {platform.processor()}",
+        f"logical CPUs: {os.cpu_count()}",
+        f"python: {sys.version.split()[0]}",
+        f"pulp: {pulp.__version__} (CBC solver bundled with PuLP)",
+        f"pandas: {pd.__version__}",
+        f"ILP time limit: {ILP_TIME_LIMIT_S} s",
+        f"SA iterations per run: {SA_ITERATIONS}",
+        f"capacity Q: {VEHICLE_CAPACITY_KG} kg",
+    ]
+    (TABLES / "environment.txt").write_text("\n".join(lines) + "\n")
+
+
+def run_e1(customers):
+    rows = []
+    for n in E1_SIZES:
+        for subset_seed in E1_SUBSET_SEEDS:
+            instance = sample_instance(customers, n=n, seed=subset_seed)
+            print(f"\nE1 {instance['name']} (Q = {instance['capacity']:.0f} kg)", flush=True)
+            rows += run_all_methods("E1", instance, subset_seed, E1_SA_SEEDS)
+    runs = pd.DataFrame(rows)
+    runs.to_csv(TABLES / "e1_runs.csv", index=False)
+    summary = summarize_instances(runs)
+    summary.to_csv(TABLES / "e1_summary.csv", index=False)
+    return runs, summary
+
+
+def run_e2(customers):
+    rows = []
+    for n in E2_SIZES:
+        instance = sample_instance(customers, n=n, seed=E2_SUBSET_SEED)
+        print(f"\nE2 {instance['name']} (Q = {instance['capacity']:.0f} kg)", flush=True)
+        rows += run_all_methods("E2", instance, E2_SUBSET_SEED, E2_SA_SEEDS)
+    runs = pd.DataFrame(rows)
+    runs.to_csv(TABLES / "e2_runs.csv", index=False)
+    summary = summarize_instances(runs)
+    summary.to_csv(TABLES / "e2_summary.csv", index=False)
+    return runs, summary
+
+
+def main():
+    which = sys.argv[1].lower() if len(sys.argv) > 1 else "all"
+    TABLES.mkdir(parents=True, exist_ok=True)
+    write_environment()
+    customers = load_customers()
+
+    columns = ["instance", "ilp_status", "ilp_km", "ilp_time_s", "greedy_km", "sa_mean_km", "sa_best_km",
+               "sa_mean_time_s", "greedy_gap_to_opt_pct", "sa_mean_gap_to_opt_pct", "sa_runs_at_optimum",
+               "sa_best_gap_to_bound_pct", "all_feasible"]
+    for name, runner in (("e1", run_e1), ("e2", run_e2)):
+        if which in (name, "all"):
+            runs, summary = runner(customers)
+            assert runs["feasible"].dropna().all(), f"{name}: an infeasible solution was produced"
+            print(f"\n{name.upper()} summary (saved to results/tables/{name}_summary.csv):")
+            print(summary[columns].round(2).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+9. src/run_heuristic_analysis.py
+====================================================================================================
+"""Experiments E3, E4 and E5: how the heuristic behaves.
+
+Owner: Luminda De Silva (Member 2)
+
+E3 (capacity sensitivity): all 87 customers with Q in {600, 1000, 1500} kg, greedy + SA (10 seeds).
+    How do van capacity, number of vans and total distance trade off?
+E4 (SA robustness and convergence): the Q = 1000 kg runs of E3 give 10 seeds on the full instance.
+    We also save the cost history of every run to plot how SA converges.
+E5 (external validation): benchmark A-n32-k5 (published optimum 784). Greedy, SA (10 seeds) and
+    the ILP with the same 300 s time limit as E1/E2.
+
+Run from the repository root (takes roughly 10-15 minutes):
+    python -m src.run_heuristic_analysis
+"""
+
+import json
+import os
+import platform
+import sys
+
+import pandas as pd
+
+from src.benchmark import load_benchmark
+from src.data_prep import REPO_ROOT, depot_location, load_customers, make_instance
+from src.evaluate import summarize
+from src.exact_ilp import solve_cvrp_ilp
+from src.heuristics import solve_greedy, solve_sa
+
+TABLES = REPO_ROOT / "results" / "tables"
+
+E3_CAPACITIES = [600, 1000, 1500]
+SA_SEEDS = list(range(10))
+ILP_TIME_LIMIT_S = 300   # same limit as in E1/E2
+
+
+def result_row(experiment, instance, result, sa_seed=None):
+    """One CSV row, scored by the shared judge in src/evaluate.py."""
+    judged = summarize(result["routes"], instance) if result["routes"] else {}
+    return {
+        "experiment": experiment,
+        "instance": instance["name"],
+        "n_customers": len(instance["demand"]) - 1,
+        "capacity": instance["capacity"],
+        "method": result["method"],
+        "sa_seed": sa_seed,
+        "status": result["status"],
+        "distance": judged.get("distance_km"),
+        "runtime_s": result["runtime_s"],
+        "n_routes": judged.get("n_routes"),
+        "min_routes_needed": judged.get("min_routes_needed"),
+        "max_load": judged.get("max_load_kg"),
+        "max_volume_dm3": judged.get("max_volume_dm3"),
+        "feasible": judged.get("feasible"),
+        "ilp_lower_bound": result.get("best_bound"),
+        "routes": json.dumps(result["routes"]),
+    }
+
+
+def history_rows(experiment, instance, result):
+    """Cost history of one SA run, for the convergence plot."""
+    return [{"experiment": experiment, "instance": instance["name"], "capacity": instance["capacity"],
+             "sa_seed": result["seed"], "iteration": it, "temperature": temp,
+             "current_distance": current, "best_distance": best}
+            for it, temp, current, best in result["history"]]
+
+
+def run_heuristics(experiment, instance, rows, histories):
+    greedy = solve_greedy(instance)
+    rows.append(result_row(experiment, instance, greedy))
+    distances = []
+    for seed in SA_SEEDS:
+        sa = solve_sa(instance, seed=seed)
+        rows.append(result_row(experiment, instance, sa, sa_seed=seed))
+        histories += history_rows(experiment, instance, sa)
+        distances.append(sa["distance_km"])
+    print(f"  greedy {greedy['distance_km']:.2f} ({len(greedy['routes'])} routes) | "
+          f"SA mean {sum(distances) / len(distances):.2f}, best {min(distances):.2f}", flush=True)
+
+
+def run_e3_e4(rows, histories):
+    customers = load_customers()
+    for capacity in E3_CAPACITIES:
+        instance = make_instance(customers, depot_location(customers), capacity=capacity,
+                                 name=f"all_87_Q{capacity}")
+        print(f"\nE3/E4 {instance['name']}", flush=True)
+        run_heuristics("E3", instance, rows, histories)
+
+
+def run_e5(rows, histories):
+    instance, optimum = load_benchmark()
+    print(f"\nE5 {instance['name']} (published optimum {optimum:.0f})", flush=True)
+    ilp = solve_cvrp_ilp(instance, time_limit=ILP_TIME_LIMIT_S)
+    rows.append(result_row("E5", instance, ilp))
+    print(f"  ILP {ilp['status']} {ilp['distance_km'] or float('nan'):.2f} in {ilp['runtime_s']:.1f} s, "
+          f"lower bound {ilp['best_bound']}", flush=True)
+    run_heuristics("E5", instance, rows, histories)
+    return optimum
+
+
+def summarize_runs(runs, e5_optimum):
+    """One row per (instance, method): mean, best, worst and spread of distance and runtime."""
+    summary = (runs.groupby(["experiment", "instance", "capacity", "method"], sort=False)
+               .agg(runs=("distance", "size"),
+                    mean_distance=("distance", "mean"),
+                    best_distance=("distance", "min"),
+                    worst_distance=("distance", "max"),
+                    std_distance=("distance", "std"),
+                    mean_runtime_s=("runtime_s", "mean"),
+                    routes_min=("n_routes", "min"),
+                    routes_max=("n_routes", "max"),
+                    min_routes_needed=("min_routes_needed", "first"),
+                    max_volume_dm3=("max_volume_dm3", "max"),
+                    all_feasible=("feasible", lambda s: bool(s.dropna().all())))
+               .reset_index())
+    is_e5 = summary["experiment"] == "E5"
+    summary.loc[is_e5, "published_optimum"] = e5_optimum
+    summary.loc[is_e5, "mean_gap_to_optimum_pct"] = 100 * (summary["mean_distance"] - e5_optimum) / e5_optimum
+    summary.loc[is_e5, "best_gap_to_optimum_pct"] = 100 * (summary["best_distance"] - e5_optimum) / e5_optimum
+    e5_sa = runs[(runs["experiment"] == "E5") & (runs["method"] == "SA")]
+    summary.loc[is_e5 & (summary["method"] == "SA"), "runs_at_optimum"] = \
+        int((abs(e5_sa["distance"] - e5_optimum) < 1e-6).sum())
+    return summary
+
+
+def write_environment():
+    """Record the machine these experiments ran on (E1/E2 may have run on another computer)."""
+    lines = [
+        f"platform: {platform.platform()}",
+        f"processor: {platform.processor()}",
+        f"logical CPUs: {os.cpu_count()}",
+        f"python: {sys.version.split()[0]}",
+        f"ILP time limit (E5): {ILP_TIME_LIMIT_S} s",
+        f"SA seeds: {SA_SEEDS[0]}-{SA_SEEDS[-1]}",
+    ]
+    (TABLES / "environment_e3_e5.txt").write_text("\n".join(lines) + "\n")
+
+
+def main():
+    TABLES.mkdir(parents=True, exist_ok=True)
+    write_environment()
+    rows, histories = [], []
+    run_e3_e4(rows, histories)
+    e5_optimum = run_e5(rows, histories)
+
+    runs = pd.DataFrame(rows)
+    assert runs["feasible"].dropna().all(), "an infeasible solution was produced"
+    runs.to_csv(TABLES / "e3_e5_runs.csv", index=False)
+    # E4 only needs the convergence history of the main case (all 87 customers, Q = 1,000 kg)
+    history = pd.DataFrame(histories)
+    history = history[history["instance"] == "all_87_Q1000"].round(4)
+    history.to_csv(TABLES / "e4_sa_history.csv", index=False)
+    summary = summarize_runs(runs, e5_optimum)
+    summary.to_csv(TABLES / "e3_e5_summary.csv", index=False)
+
+    print("\nSummary (saved to results/tables/e3_e5_summary.csv):")
+    columns = ["instance", "method", "runs", "mean_distance", "best_distance", "worst_distance", "std_distance",
+               "mean_runtime_s", "routes_min", "routes_max", "min_routes_needed", "max_volume_dm3",
+               "mean_gap_to_optimum_pct", "runs_at_optimum"]
+    print(summary[columns].round(2).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+10. src/verify_exact.py
+====================================================================================================
+"""Independent check that the ILP in src/exact_ilp.py really finds the optimum.
+
+Owner: M.Z.M. Ruzbihan (Member 1)
+
+On small instances we can find the true optimum by exhaustive dynamic programming, without
+any solver, and compare it with the ILP result. If the formulation had a mistake (for example
+a missing constraint), the two numbers would differ.
+
+How the dynamic programming works (customers are represented as subsets S):
+    1. tour[S] = shortest single-van tour depot -> every customer in S -> depot,
+                 found with the Held-Karp algorithm; only allowed if load(S) <= Q.
+    2. best[S] = cheapest way to serve all of S with any number of vans
+               = min over feasible van groups T that contain the first customer of S
+                 of tour[T] + best[S without T].
+    The answer is best[all customers]. Time grows like 3^n, so this is only for small n.
+
+Run from the repository root (takes about one minute):
+    python -m src.verify_exact
+"""
+
+import pandas as pd
+
+from src.data_prep import REPO_ROOT, load_customers, sample_instance
+from src.exact_ilp import solve_cvrp_ilp
+
+RESULTS_PATH = REPO_ROOT / "results" / "tables" / "ilp_verification.csv"
+
+# (number of customers, subset seed, capacity Q in kg)
+CASES = [(8, 1, 1000), (8, 2, 1000), (10, 1, 1000), (10, 2, 1000), (10, 3, 600), (12, 2, 1000)]
+
+
+def exhaustive_optimum(instance):
+    """True optimal total distance by dynamic programming over customer subsets."""
+    dist = instance["dist"]
+    demand = instance["demand"]
+    capacity = instance["capacity"]
+    n = len(demand) - 1
+    infinity = float("inf")
+
+    # Customer k (0-based in the bit mask) is node k + 1 in the instance.
+    # path[S][k] = shortest path from the depot that visits all of S and ends at customer k.
+    path = [[infinity] * n for _ in range(1 << n)]
+    for k in range(n):
+        path[1 << k][k] = dist[0][k + 1]
+    for subset in range(1, 1 << n):
+        for k in range(n):
+            if not (subset >> k) & 1 or path[subset][k] == infinity:
+                continue
+            for m in range(n):
+                if (subset >> m) & 1:
+                    continue
+                bigger = subset | (1 << m)
+                new_length = path[subset][k] + dist[k + 1][m + 1]
+                if new_length < path[bigger][m]:
+                    path[bigger][m] = new_length
+
+    # tour[S]: close the path back to the depot, only if one van can carry all of S.
+    tour = [infinity] * (1 << n)
+    for subset in range(1, 1 << n):
+        load = sum(demand[k + 1] for k in range(n) if (subset >> k) & 1)
+        if load <= capacity + 1e-9:
+            tour[subset] = min(path[subset][k] + dist[k + 1][0] for k in range(n) if (subset >> k) & 1)
+
+    # best[S]: split S into van groups.
+    best = [infinity] * (1 << n)
+    best[0] = 0.0
+    for subset in range(1, 1 << n):
+        first = subset & -subset          # lowest customer in S, must be in some van group
+        rest = subset ^ first
+        group_rest = rest
+        while True:                       # loop over every sub-group of `rest`
+            group = group_rest | first
+            if tour[group] < infinity:
+                best[subset] = min(best[subset], tour[group] + best[subset ^ group])
+            if group_rest == 0:
+                break
+            group_rest = (group_rest - 1) & rest
+    return best[(1 << n) - 1]
+
+
+def main():
+    customers = load_customers()
+    rows = []
+    for n, seed, capacity in CASES:
+        instance = sample_instance(customers, n=n, seed=seed, capacity=capacity)
+        ilp = solve_cvrp_ilp(instance)
+        exact = exhaustive_optimum(instance)
+        match = ilp["status"] == "optimal" and abs(ilp["distance_km"] - exact) < 1e-4
+        rows.append({
+            "instance": instance["name"],
+            "n_customers": n,
+            "capacity_kg": capacity,
+            "ilp_status": ilp["status"],
+            "ilp_distance_km": round(ilp["distance_km"], 4),
+            "exhaustive_distance_km": round(exact, 4),
+            "ilp_routes": len(ilp["routes"]),
+            "ilp_runtime_s": round(ilp["runtime_s"], 2),
+            "match": match,
+        })
+        print(f"n={n:2d} seed={seed} Q={capacity:4d}: ILP {ilp['distance_km']:.4f} km ({ilp['status']}, "
+              f"{len(ilp['routes'])} routes) | exhaustive {exact:.4f} km | match: {match}")
+
+    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(RESULTS_PATH, index=False)
+    print(f"\nSaved {RESULTS_PATH.relative_to(REPO_ROOT)}")
+    all_match = all(row["match"] for row in rows)
+    print("ALL MATCH: the ILP finds the true optimum." if all_match else "MISMATCH: check the ILP model.")
+    assert all_match
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+11. scripts/make_code_appendix.py
+====================================================================================================
+"""Create the plain-text code appendix required by the assignment brief.
+
+Owner: U.D.L.L De Silva (Member 2)
+
+It copies every Python source file and the code cells of every notebook into one UTF-8 text
+file, with a header per file, so the appendix always matches the code in the repository.
+The Git commit it was generated from is written at the top.
+
+Run from the repository root (after the final commit):
+    python scripts/make_code_appendix.py
+"""
+
+import json
+import subprocess
+from datetime import date
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT = REPO_ROOT / "report" / "code_appendix.txt"
+RULE = "=" * 100
+
+
+def source_files():
+    """All files that go into the appendix, in a fixed order."""
+    python_files = sorted((REPO_ROOT / "src").glob("*.py")) + sorted((REPO_ROOT / "scripts").glob("*.py"))
+    notebooks = sorted((REPO_ROOT / "notebooks").glob("*.ipynb"))
+    return python_files, notebooks
+
+
+def notebook_code(path):
+    """Only the code cells of a notebook (outputs and text cells are left out)."""
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    cells = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
+    parts = []
+    for number, cell in enumerate(cells, start=1):
+        source = "".join(cell["source"]) if isinstance(cell["source"], list) else cell["source"]
+        parts.append(f"# ---- code cell {number} ----\n{source.rstrip()}\n")
+    return "\n".join(parts)
+
+
+def current_commit():
+    """Short hash of the current Git commit, so the appendix can be traced to the repository."""
+    try:
+        result = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT,
+                                capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def main():
+    python_files, notebooks = source_files()
+    sections = [(path, path.read_text(encoding="utf-8")) for path in python_files]
+    sections += [(path, notebook_code(path)) for path in notebooks]
+
+    header = [
+        RULE,
+        "CODE APPENDIX - Delivery Optimization (Capacitated Vehicle Routing Problem)",
+        "IT50802 Optimization Methods, MSc in Artificial Intelligence, SLIIT",
+        "M.Z.M. Ruzbihan (MS26911458) and U.D.L.L De Silva (MS26903224)",
+        f"Generated on {date.today().isoformat()} from Git commit {current_commit()}",
+        "Repository: https://github.com/RuzbihanZaleek/optimization-methods-assignment",
+        RULE,
+        "",
+        "Contents",
+    ]
+    for number, (path, text) in enumerate(sections, start=1):
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        kind = " (code cells only)" if path.suffix == ".ipynb" else ""
+        header.append(f"  {number:2d}. {relative}{kind} - {len(text.splitlines())} lines")
+    header.append("")
+
+    body = []
+    for number, (path, text) in enumerate(sections, start=1):
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        body += [RULE, f"{number}. {relative}", RULE, text.rstrip() if text.strip() else "(empty file)", ""]
+
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT.write_text("\n".join(header + body) + "\n", encoding="utf-8")
+    total_lines = sum(len(text.splitlines()) for _, text in sections)
+    print(f"Wrote {OUTPUT.relative_to(REPO_ROOT).as_posix()}: {len(sections)} files, {total_lines} lines of code")
+
+
+if __name__ == "__main__":
+    main()
+
+====================================================================================================
+12. notebooks/01_data_and_model.ipynb
+====================================================================================================
+# ---- code cell 1 ----
+import sys
+from pathlib import Path
+
+# Make the repository root importable when the notebook runs from notebooks/
+REPO_ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+sys.path.insert(0, str(REPO_ROOT))
+
+import math
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from src.data_prep import (VEHICLE_CAPACITY_KG, VAN_VOLUME_DM3, load_raw, clean_customers,
+                           depot_location, haversine_km, make_instance, sample_instance)
+from src.exact_ilp import build_model, solve_cvrp_ilp
+
+FIGURES = REPO_ROOT / "results" / "figures"
+FIGURES.mkdir(parents=True, exist_ok=True)
+pd.set_option("display.width", 120)
+
+# ---- code cell 2 ----
+raw = load_raw()
+print(f"Raw sheet: {raw.shape[0]} rows x {raw.shape[1]} columns")
+print("Columns:", list(raw.columns))
+print(f"Rows with a CUSTOMER ID: {raw['CUSTOMER ID'].notna().sum()}")
+print(f"Rows WITHOUT a CUSTOMER ID: {raw['CUSTOMER ID'].isna().sum()}")
+raw.head()
+
+# ---- code cell 3 ----
+raw.iloc[85:92]
+
+# ---- code cell 4 ----
+customers = clean_customers(raw)
+print(f"Clean customers: {len(customers)}")
+customers.head(10)
+
+# ---- code cell 5 ----
+summary = customers[["lat", "lon", "weight_kg", "volume_dm3"]].describe().round(3)
+summary
+
+# ---- code cell 6 ----
+total_weight = customers["weight_kg"].sum()
+print("Priority counts:", customers["priority"].value_counts().sort_index().to_dict())
+print("Customers without a time slot:", customers["time_slot"].isna().sum(), "of", len(customers))
+print(f"Total weight: {total_weight:.1f} kg | total volume: {customers['volume_dm3'].sum():.1f} dm3")
+print(f"Largest single order: {customers['weight_kg'].max():.1f} kg, {customers['volume_dm3'].max():.1f} dm3")
+print(f"Lower bound on vans at Q = {VEHICLE_CAPACITY_KG:.0f} kg: ceil({total_weight:.1f} / {VEHICLE_CAPACITY_KG:.0f}) = "
+      f"{math.ceil(total_weight / VEHICLE_CAPACITY_KG)}")
+
+# ---- code cell 7 ----
+depot = depot_location(customers)
+print(f"Depot (centroid): lat {depot[0]:.4f}, lon {depot[1]:.4f}")
+
+fig, ax = plt.subplots(figsize=(9, 6))
+colours = {1: "tab:blue", 2: "tab:orange", 3: "tab:red"}
+for priority, group in customers.groupby("priority"):
+    ax.scatter(group["lon"], group["lat"], s=group["weight_kg"] / 1.5, alpha=0.7,
+               color=colours[priority], edgecolor="white", label=f"Priority {priority} ({len(group)})")
+ax.scatter(depot[1], depot[0], marker="s", s=120, color="black", label="Depot (assumed centroid)")
+ax.set_xlabel("Longitude (degrees)")
+ax.set_ylabel("Latitude (degrees)")
+ax.set_title("87 real customer locations (dot size = order weight)")
+ax.set_aspect(1 / math.cos(math.radians(depot[0])))   # so 1 km looks the same in both directions
+ax.legend(loc="upper left")
+ax.grid(alpha=0.3)
+fig.tight_layout()
+fig.savefig(FIGURES / "f1_customer_map.png", dpi=200)
+plt.show()
+
+# ---- code cell 8 ----
+full = make_instance(customers, depot, name="all_87")
+dist = full["dist"]
+off_diagonal = dist[~np.eye(len(dist), dtype=bool)]
+print(f"Matrix size: {dist.shape}")
+print(f"Symmetric: {np.allclose(dist, dist.T)} | zero diagonal: {np.all(np.diag(dist) == 0)}")
+print(f"Shortest distance: {off_diagonal.min():.2f} km | longest: {off_diagonal.max():.2f} km")
+print(f"Sanity check, 1 degree of latitude: {haversine_km(0, 0, 1, 0):.2f} km (expected 111.19)")
+pd.DataFrame(dist[:6, :6], index=[f"node {i}" for i in range(6)],
+             columns=[f"node {j}" for j in range(6)]).round(2)
+
+# ---- code cell 9 ----
+for n in (5, 10, 20, 87):
+    variables = n * (n + 1) + n          # x_ij for i != j over n+1 nodes, plus u_i
+    mtz = n * (n - 1)                    # constraint (5)
+    print(f"n = {n:2d}: about {variables:5d} variables and {2 * n + 1 + mtz:5d} constraints")
+
+# ---- code cell 10 ----
+instance = sample_instance(customers, n=10, seed=3, capacity=600)
+model, _, _ = build_model(instance)
+print(f"Instance {instance['name']}: Kaggle customers {instance['customer_ids']}")
+print(f"Total demand {sum(instance['demand']):.1f} kg, Q = {instance['capacity']:.0f} kg "
+      f"-> at least {math.ceil(sum(instance['demand']) / instance['capacity'])} vans")
+print(f"Model: {len(model.variables())} variables, {len(model.constraints)} constraints")
+
+result = solve_cvrp_ilp(instance)
+print(f"\nStatus: {result['status']} | total distance: {result['distance_km']:.2f} km | "
+      f"runtime: {result['runtime_s']:.2f} s | gap: {result['gap_pct']:.2f} %")
+for k, route in enumerate(result["routes"], start=1):
+    load = sum(instance["demand"][node] for node in route)
+    km = sum(instance["dist"][a][b] for a, b in zip(route, route[1:]))
+    kaggle_ids = [instance["customer_ids"][node - 1] for node in route[1:-1]]
+    print(f"  Van {k}: Kaggle customers {kaggle_ids} | load {load:.1f} kg | {km:.2f} km")
+
+# ---- code cell 11 ----
+fig, ax = plt.subplots(figsize=(8, 6))
+lats, lons = instance["lats"], instance["lons"]
+for k, route in enumerate(result["routes"], start=1):
+    ax.plot([lons[node] for node in route], [lats[node] for node in route], "-o", label=f"Van {k}")
+ax.scatter(lons[0], lats[0], marker="s", s=120, color="black", zorder=5, label="Depot")
+for node in range(1, len(lats)):
+    ax.annotate(str(instance["customer_ids"][node - 1]), (lons[node], lats[node]),
+                textcoords="offset points", xytext=(4, 4), fontsize=8)
+ax.set_xlabel("Longitude (degrees)")
+ax.set_ylabel("Latitude (degrees)")
+ax.set_title(f"Optimal ILP routes, {instance['name']}, Q = 600 kg ({result['distance_km']:.1f} km)")
+ax.set_aspect(1 / math.cos(math.radians(lats[0])))
+ax.legend()
+ax.grid(alpha=0.3)
+fig.tight_layout()
+fig.savefig(FIGURES / "f2a_ilp_routes_n10.png", dpi=200)
+plt.show()
+
+# ---- code cell 12 ----
+verification_path = REPO_ROOT / "results" / "tables" / "ilp_verification.csv"
+if verification_path.exists():
+    display(pd.read_csv(verification_path))
+else:
+    print("Run `python -m src.verify_exact` first.")
+
+# ---- code cell 13 ----
+bigger = sample_instance(customers, n=20, seed=1)
+limited = solve_cvrp_ilp(bigger, time_limit=20)
+print(f"{bigger['name']}: status {limited['status']} after {limited['runtime_s']:.1f} s")
+print(f"Best plan found: {limited['distance_km']:.2f} km | lower bound: {limited['best_bound']:.2f} km | "
+      f"gap: {limited['gap_pct']:.1f} %")
+
+====================================================================================================
+13. notebooks/02_heuristic_and_results.ipynb
+====================================================================================================
+# ---- code cell 1 ----
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+sys.path.insert(0, str(REPO_ROOT))
+
+import math
+import matplotlib.pyplot as plt
+import pandas as pd
+from IPython.display import Image, display
+
+from src.data_prep import depot_location, load_customers, make_instance, sample_instance
+from src.evaluate import check_feasible, make_toy_instance, summarize
+from src.heuristics import SA_ITERATIONS, nearest_neighbour, solve_greedy, solve_sa
+from src.plots import STYLE, draw_routes
+
+TABLES = REPO_ROOT / "results" / "tables"
+FIGURES = REPO_ROOT / "results" / "figures"
+pd.set_option("display.width", 140)
+customers = load_customers()
+
+# ---- code cell 2 ----
+toy = make_toy_instance()
+toy_routes = nearest_neighbour(toy)
+print("Greedy routes:", toy_routes)
+print("Total distance:", summarize(toy_routes, toy)["distance_km"], "(hand calculation: 24)")
+print("Feasibility problems:", check_feasible(toy_routes, toy))
+
+# ---- code cell 3 ----
+# How likely is SA to accept a move that makes the plan 10 km longer?
+delta = 10.0
+for temperature in (124.8, 50, 10, 1, 0.12):
+    print(f"T = {temperature:6.2f}  ->  P(accept a +10 km move) = {math.exp(-delta / temperature):.5f}")
+print(f"\nIterations per SA run: {SA_ITERATIONS:,}")
+
+# ---- code cell 4 ----
+small = sample_instance(customers, n=10, seed=3, capacity=600)
+greedy_small = solve_greedy(small)
+sa_small = solve_sa(small, seed=0)
+print(f"Greedy: {greedy_small['distance_km']:.2f} km")
+print(f"SA:     {sa_small['distance_km']:.2f} km in {sa_small['runtime_s']:.1f} s (proven optimum: 557.91 km)")
+print("SA feasibility problems:", check_feasible(sa_small["routes"], small))
+
+# ---- code cell 5 ----
+full = make_instance(customers, depot_location(customers), name="all_87")
+greedy_full = solve_greedy(full)
+sa_full = solve_sa(full, seed=0)
+improvement = 100 * (greedy_full["distance_km"] - sa_full["distance_km"]) / greedy_full["distance_km"]
+print(f"Greedy: {greedy_full['distance_km']:.2f} km with {len(greedy_full['routes'])} vans")
+print(f"SA:     {sa_full['distance_km']:.2f} km with {len(sa_full['routes'])} vans in {sa_full['runtime_s']:.1f} s "
+      f"(T0 = {sa_full['start_temperature']:.1f})")
+print(f"SA is {improvement:.1f} % shorter than greedy")
+print("Shared checker:", summarize(sa_full["routes"], full))
+
+# ---- code cell 6 ----
+fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharex=True, sharey=True)
+draw_routes(axes[0], full, greedy_full["routes"], STYLE["Greedy"]["color"],
+            f"Greedy: {greedy_full['distance_km']:.0f} km")
+draw_routes(axes[1], full, sa_full["routes"], STYLE["SA"]["color"],
+            f"Simulated annealing (seed 0): {sa_full['distance_km']:.0f} km")
+fig.tight_layout()
+plt.show()
+
+# ---- code cell 7 ----
+history = pd.DataFrame(sa_full["history"], columns=["iteration", "temperature", "current", "best"])
+fig, ax = plt.subplots(figsize=(8, 3.6))
+ax.plot(history["iteration"], history["current"], color=STYLE["SA"]["color"], linewidth=1, label="Current")
+ax.plot(history["iteration"], history["best"], color="black", linewidth=2, label="Best so far")
+ax.set_xlabel("Iteration")
+ax.set_ylabel("Total distance (km)")
+ax.set_title("SA convergence (this live run)")
+ax.legend()
+plt.show()
+
+# ---- code cell 8 ----
+e1 = pd.read_csv(TABLES / "e1_summary.csv")
+e1_view = e1[["instance", "ilp_km", "ilp_time_s", "greedy_km", "greedy_gap_to_opt_pct",
+              "sa_mean_km", "sa_mean_gap_to_opt_pct", "sa_runs_at_optimum", "sa_mean_time_s"]].copy()
+e1_view["sa_mean_gap_to_opt_pct"] = e1_view["sa_mean_gap_to_opt_pct"].clip(lower=0)
+display(e1_view.round(2))
+print(f"SA runs at the proven optimum: {int(e1['sa_runs_at_optimum'].sum())} of {10 * len(e1)}")
+print(f"Greedy gap to optimum: {e1['greedy_gap_to_opt_pct'].min():.1f} % to {e1['greedy_gap_to_opt_pct'].max():.1f} %")
+
+# ---- code cell 9 ----
+display(Image(FIGURES / "f6_gap_to_optimum.png", width=750))
+display(Image(FIGURES / "f3_greedy_vs_optimal_routes.png", width=850))
+
+# ---- code cell 10 ----
+e2 = pd.read_csv(TABLES / "e2_summary.csv")
+display(e2[["instance", "ilp_status", "ilp_km", "ilp_lower_bound_km", "ilp_time_s",
+            "greedy_km", "sa_mean_km", "sa_best_km", "sa_mean_time_s"]].round(2))
+display(Image(FIGURES / "f4_runtime_vs_size.png", width=750))
+display(Image(FIGURES / "f5_distance_vs_size.png", width=750))
+
+# ---- code cell 11 ----
+e35 = pd.read_csv(TABLES / "e3_e5_summary.csv")
+e3 = e35[e35["experiment"] == "E3"]
+display(e3[["instance", "method", "mean_distance", "best_distance", "std_distance", "routes_min",
+            "min_routes_needed", "max_volume_dm3", "mean_runtime_s"]].round(2))
+display(Image(FIGURES / "f9_capacity_sensitivity.png", width=850))
+
+# ---- code cell 12 ----
+display(Image(FIGURES / "f8_sa_seed_spread.png", width=850))
+display(Image(FIGURES / "f7_sa_convergence.png", width=750))
+
+# ---- code cell 13 ----
+e5 = e35[e35["experiment"] == "E5"]
+display(e5[["method", "runs", "mean_distance", "best_distance", "worst_distance", "mean_gap_to_optimum_pct",
+            "runs_at_optimum", "mean_runtime_s"]].round(2))
+display(Image(FIGURES / "f10_benchmark.png", width=750))
+display(Image(FIGURES / "f11_routes_all87_greedy_vs_sa.png", width=850))
+
