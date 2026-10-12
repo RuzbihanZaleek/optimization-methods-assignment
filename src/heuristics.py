@@ -1,6 +1,6 @@
 """Heuristic method: greedy nearest-neighbour construction + Simulated Annealing improvement.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 Part 1, greedy (nearest neighbour):
     1. Start a new van at the depot with an empty load.

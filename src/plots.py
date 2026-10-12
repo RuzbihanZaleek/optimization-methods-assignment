@@ -1,6 +1,6 @@
 """All result figures for the report and the video, made from the CSV files in results/tables/.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 Each method always has the same colour AND marker shape, so the figures can be read in
 black-and-white print and by colour-blind readers:

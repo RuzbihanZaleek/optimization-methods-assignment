@@ -1,6 +1,6 @@
 """Benchmark instance A-n32-k5 (Augerat et al., CVRPLIB) for external validation of our methods.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 Why: on our own data the ILP cannot prove optimality beyond about 12 customers, so we cannot
 measure how good SA is on larger instances. A-n32-k5 (31 customers, Q = 100) has a published

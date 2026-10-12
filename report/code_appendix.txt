@@ -31,7 +31,7 @@ Contents
 ====================================================================================================
 """Benchmark instance A-n32-k5 (Augerat et al., CVRPLIB) for external validation of our methods.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 Why: on our own data the ILP cannot prove optimality beyond about 12 customers, so we cannot
 measure how good SA is on larger instances. A-n32-k5 (31 customers, Q = 100) has a published
@@ -321,7 +321,7 @@ if __name__ == "__main__":
 ====================================================================================================
 """Solution evaluation: route distance and feasibility checker.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 Every method (ILP, greedy, simulated annealing) is judged by the SAME functions in this file,
 so the comparison is fair and no method grades its own work.
@@ -641,7 +641,7 @@ if __name__ == "__main__":
 ====================================================================================================
 """Heuristic method: greedy nearest-neighbour construction + Simulated Annealing improvement.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 Part 1, greedy (nearest neighbour):
     1. Start a new van at the depot with an empty load.
@@ -931,7 +931,7 @@ if __name__ == "__main__":
 ====================================================================================================
 """All result figures for the report and the video, made from the CSV files in results/tables/.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 Each method always has the same colour AND marker shape, so the figures can be read in
 black-and-white print and by colour-blind readers:
@@ -1451,7 +1451,7 @@ if __name__ == "__main__":
 ====================================================================================================
 """Experiments E3, E4 and E5: how the heuristic behaves.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 E3 (capacity sensitivity): all 87 customers with Q in {600, 1000, 1500} kg, greedy + SA (10 seeds).
     How do van capacity, number of vans and total distance trade off?

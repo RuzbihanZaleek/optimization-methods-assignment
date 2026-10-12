@@ -1,6 +1,6 @@
 """Experiments E3, E4 and E5: how the heuristic behaves.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 E3 (capacity sensitivity): all 87 customers with Q in {600, 1000, 1500} kg, greedy + SA (10 seeds).
     How do van capacity, number of vans and total distance trade off?
