@@ -61,6 +61,8 @@ python -m src.run_comparison   # experiments E1 + E2: ILP vs greedy vs SA (about
 python -m src.benchmark                 # check the A-n32-k5 benchmark loader (published optimum 784)
 python -m src.run_heuristic_analysis    # experiments E3-E5 (about 15 minutes)
 python -m src.plots                     # all result figures -> results/figures/
+jupyter notebook notebooks/02_heuristic_and_results.ipynb   # heuristic demo and all results
+python scripts/make_code_appendix.py                         # plain-text code appendix -> report/code_appendix.txt
 ```
 
 In VS Code, choose the `.venv` Python as the notebook kernel, otherwise `pulp` will not be found.
