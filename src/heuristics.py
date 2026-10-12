@@ -1,6 +1,6 @@
 """Heuristic method: greedy nearest-neighbour construction + Simulated Annealing improvement.
 
-Owner: Luminda De Silva (Member 2)
+Owner: U.D.L.L De Silva (Member 2)
 
 Part 1, greedy (nearest neighbour):
     1. Start a new van at the depot with an empty load.
@@ -265,7 +265,7 @@ def main():
     greedy = solve_greedy(full)
     sa = solve_sa(full, seed=0)
     improvement = 100 * (greedy["distance_km"] - sa["distance_km"]) / greedy["distance_km"]
-    print(f"\nAll 87 customers (Q = 1,000 kg):")
+    print("\nAll 87 customers (Q = 1,000 kg):")
     print(f"  greedy: {greedy['distance_km']:.2f} km, {len(greedy['routes'])} vans")
     print(f"  SA:     {sa['distance_km']:.2f} km, {len(sa['routes'])} vans, {sa['runtime_s']:.1f} s, "
           f"T0 = {sa['start_temperature']:.2f}, {sa['iterations']} iterations")
