@@ -13,3 +13,7 @@ __pycache__/
 # See data/README.md for the download command.
 data/raw/
 data/processed/
+
+# Office lock files and the submission ZIP (submitted separately, not part of the repo)
+~$*
+Optimization-assignment.zip
