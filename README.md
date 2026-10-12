@@ -77,5 +77,7 @@ results/         generated tables (CSV) and figures (PNG)
 report/          report and plain-text code appendix
 ```
 
+```
 jupyter notebook notebooks/02_heuristic_and_results.ipynb   # heuristic demo and all results
 python scripts/make_code_appendix.py                         # plain-text code appendix -> report/code_appendix.txt
+```
