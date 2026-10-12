@@ -5,7 +5,7 @@ Owner: U.D.L.L De Silva (Member 2)
 E3 (capacity sensitivity): all 87 customers with Q in {600, 1000, 1500} kg, greedy + SA (10 seeds).
     How do van capacity, number of vans and total distance trade off?
 E4 (SA robustness and convergence): the Q = 1000 kg runs of E3 give 10 seeds on the full instance.
-    We also save the cost history of every run to plot how SA converges.
+    We also save the cost history of these runs to plot how SA converges.
 E5 (external validation): benchmark A-n32-k5 (published optimum 784). Greedy, SA (10 seeds) and
     the ILP with the same 300 s time limit as E1/E2.
 
